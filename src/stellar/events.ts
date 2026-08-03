@@ -23,7 +23,29 @@ export const EVENT_FIELDS = {
   name_reg: ['name', 'owner'],
   committed: ['proposal_id', 'voter'],
   revealed: ['proposal_id', 'voter', 'support'],
+  doc_attn: ['kind', 'proposal_id', 'caller'],
+  // Admin/governance events. `policy`, `paused`, and `unpaused` carry no data
+  // tuple (the contract publishes `()`), so they have no named fields.
+  init: ['admins', 'consensus_threshold', 'membership_fee', 'token'],
+  admin_add: ['admin'],
+  admin_rem: ['admin'],
+  threshold: ['threshold'],
+  policy: [],
+  paused: [],
+  unpaused: [],
 } as const
+
+/** Event symbols that represent governance/admin actions rather than DAO
+ *  member activity. Used to power the admin audit log endpoint. */
+export const ADMIN_EVENT_SYMBOLS = [
+  'init',
+  'admin_add',
+  'admin_rem',
+  'threshold',
+  'policy',
+  'paused',
+  'unpaused',
+] as const
 
 export type EventSymbol = keyof typeof EVENT_FIELDS
 
