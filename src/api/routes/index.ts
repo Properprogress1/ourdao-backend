@@ -85,6 +85,20 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return query<EventRow>('SELECT * FROM events ORDER BY ledger DESC LIMIT $1', [l])
   })
 
+  // --- Mark a single notification as read ---
+  app.patch<{ Params: { id: string } }>('/notifications/:id/read', async (req, reply) => {
+    const id = Number(req.params.id)
+    if (!Number.isFinite(id)) {
+      return reply.code(400).send({ error: 'invalid notification id' })
+    }
+    const row = await queryOne<NotificationRow>(
+      'UPDATE notifications SET read = true WHERE id = $1 RETURNING *',
+      [id]
+    )
+    if (!row) return reply.code(404).send({ error: 'notification not found' })
+    return row
+  })
+
   // --- Admin/governance audit log (init, admin add/remove, threshold,
   // policy, pause/unpause) ---
   app.get('/admin/log', async (req) => {
