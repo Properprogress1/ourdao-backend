@@ -18,6 +18,13 @@ function limit(v: unknown, def = 50, max = 200): number {
   return Math.min(n, max)
 }
 
+// Parse an optional numeric pagination cursor (e.g. `?before=`). Returns null
+// when absent or invalid, meaning "start from the newest row."
+function cursor(v: unknown): number | null {
+  const n = Number.parseInt(String(v ?? ''), 10)
+  return Number.isFinite(n) ? n : null
+}
+
 export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // --- Members ---
   app.get('/members', async (req) => {
@@ -75,14 +82,29 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     )
   })
 
-  // --- Raw event feed ---
+  // --- Raw event feed (optional ?symbol= filter, ?before=<ledger> cursor) ---
   app.get('/events', async (req) => {
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
-    if (typeof q.symbol === 'string' && q.symbol) {
-      return query<EventRow>('SELECT * FROM events WHERE symbol = $1 ORDER BY ledger DESC LIMIT $2', [q.symbol, l])
+    const before = cursor(q.before)
+    const symbol = typeof q.symbol === 'string' && q.symbol ? q.symbol : null
+
+    const conditions: string[] = []
+    const params: unknown[] = []
+    if (symbol) {
+      params.push(symbol)
+      conditions.push(`symbol = $${params.length}`)
     }
-    return query<EventRow>('SELECT * FROM events ORDER BY ledger DESC LIMIT $1', [l])
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`ledger < $${params.length}`)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    params.push(l)
+    return query<EventRow>(
+      `SELECT * FROM events ${where} ORDER BY ledger DESC LIMIT $${params.length}`,
+      params
+    )
   })
 
   // --- Mark a single notification as read ---
