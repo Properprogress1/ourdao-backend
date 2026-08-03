@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { query, queryOne } from '../../db/index.js'
+import { ADMIN_EVENT_SYMBOLS } from '../../stellar/events.js'
 import type {
   DAOStats,
   LoanProposalRow,
@@ -82,6 +83,16 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       return query<EventRow>('SELECT * FROM events WHERE symbol = $1 ORDER BY ledger DESC LIMIT $2', [q.symbol, l])
     }
     return query<EventRow>('SELECT * FROM events ORDER BY ledger DESC LIMIT $1', [l])
+  })
+
+  // --- Admin/governance audit log (init, admin add/remove, threshold,
+  // policy, pause/unpause) ---
+  app.get('/admin/log', async (req) => {
+    const l = limit((req.query as Record<string, unknown>).limit)
+    return query<EventRow>(
+      `SELECT * FROM events WHERE symbol = ANY($1) ORDER BY ledger DESC LIMIT $2`,
+      [ADMIN_EVENT_SYMBOLS as unknown as string[], l]
+    )
   })
 
   // --- Aggregate stats ---
