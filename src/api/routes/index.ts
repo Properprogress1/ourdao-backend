@@ -99,6 +99,19 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return row
   })
 
+  // --- Mark all of an address's notifications as read ---
+  app.patch('/notifications/read-all', async (req, reply) => {
+    const q = req.query as Record<string, unknown>
+    if (typeof q.address !== 'string' || !q.address) {
+      return reply.code(400).send({ error: 'address query param is required' })
+    }
+    const rows = await query<NotificationRow>(
+      'UPDATE notifications SET read = true WHERE address = $1 AND read = false RETURNING id',
+      [q.address]
+    )
+    return { updated: rows.length }
+  })
+
   // --- Admin/governance audit log (init, admin add/remove, threshold,
   // policy, pause/unpause) ---
   app.get('/admin/log', async (req) => {
