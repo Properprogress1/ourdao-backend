@@ -33,6 +33,8 @@ export const config = {
     startLookbackLedgers: int('START_LOOKBACK_LEDGERS', 17280),
     pollIntervalMs: int('POLL_INTERVAL_MS', 5000),
     pageLimit: int('EVENTS_PAGE_LIMIT', 100),
+    // Cap for the exponential backoff applied after consecutive poll failures.
+    maxBackoffMs: int('POLL_MAX_BACKOFF_MS', 60_000),
   },
 } as const
 

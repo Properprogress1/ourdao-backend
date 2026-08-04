@@ -92,18 +92,31 @@ async function fetchOnce(contractId: string): Promise<void> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** Run the poll loop until stopped. Errors are logged and retried. */
+/** Run the poll loop until stopped. Errors are logged and retried with
+ *  exponential backoff (capped at `POLL_MAX_BACKOFF_MS`) so a stuck or down
+ *  RPC endpoint doesn't get hammered every `pollIntervalMs`. The delay resets
+ *  to the normal interval as soon as a poll succeeds. */
 export async function runIndexer(): Promise<void> {
   const contractId = assertContractConfigured()
   console.log(`[indexer] watching ${contractId} on ${config.stellar.rpcUrl}`)
+  let consecutiveFailures = 0
   while (!stopped) {
+    let delay = config.indexer.pollIntervalMs
     try {
       await fetchOnce(contractId)
+      consecutiveFailures = 0
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      console.error('[indexer] poll error:', msg)
+      consecutiveFailures += 1
+      delay = Math.min(
+        config.indexer.pollIntervalMs * 2 ** consecutiveFailures,
+        config.indexer.maxBackoffMs
+      )
+      console.error(
+        `[indexer] poll error (${consecutiveFailures} consecutive): ${msg} — retrying in ${delay}ms`
+      )
     }
-    await sleep(config.indexer.pollIntervalMs)
+    await sleep(delay)
   }
 }
 
