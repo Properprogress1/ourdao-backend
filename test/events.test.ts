@@ -1,0 +1,86 @@
+import { describe, expect, it } from 'vitest'
+import { Address, Keypair, nativeToScVal, xdr, type rpc } from '@stellar/stellar-sdk'
+import { ADMIN_EVENT_SYMBOLS, EVENT_FIELDS, decodeEvent, toJsonSafe } from '../src/stellar/events.js'
+
+const ADDR = Keypair.random().publicKey()
+
+/** Build a minimal getEvents response entry, shaped like the real RPC would
+ *  return it. `data` is what the contract published as the event's value
+ *  tuple (already ScVal-encoded); pass `undefined` for unit-value events
+ *  (e.g. `paused`, published with `()`). */
+function makeEvent(symbol: string, data?: xdr.ScVal): rpc.Api.EventResponse {
+  return {
+    id: '0000012345-0000000001',
+    type: 'contract',
+    ledger: 12345,
+    ledgerClosedAt: '2026-01-01T00:00:00Z',
+    transactionIndex: 1,
+    operationIndex: 0,
+    inSuccessfulContractCall: true,
+    txHash: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    contractId: 'CCONTRACTIDPLACEHOLDER00000000000000000000000000000000000000',
+    topic: [xdr.ScVal.scvSymbol(symbol)],
+    value: data ?? xdr.ScVal.scvVoid(),
+  } as unknown as rpc.Api.EventResponse
+}
+
+function tuple(...vals: xdr.ScVal[]): xdr.ScVal {
+  return xdr.ScVal.scvVec(vals)
+}
+
+describe('decodeEvent', () => {
+  it('decodes a known symbol into named fields', () => {
+    const data = tuple(new Address(ADDR).toScVal(), nativeToScVal(500n, { type: 'i128' }))
+    const ev = decodeEvent(makeEvent('joined', data))
+
+    expect(ev.symbol).toBe('joined')
+    expect(ev.fields.member).toBe(ADDR)
+    expect(ev.fields.fee).toBe('500')
+  })
+
+  it('names every field for every catalog entry that has data', () => {
+    // amount/fee/etc are i128 -> bigint at decode time, which must survive
+    // JSON/JSONB round-tripping as a string (toJsonSafe).
+    const data = tuple(
+      nativeToScVal(7, { type: 'u32' }),
+      new Address(ADDR).toScVal(),
+      nativeToScVal(1_000_000_000_000n, { type: 'i128' }),
+      nativeToScVal(1_100_000_000_000n, { type: 'i128' })
+    )
+    const ev = decodeEvent(makeEvent('loan_req', data))
+    expect(Object.keys(ev.fields)).toEqual(EVENT_FIELDS.loan_req)
+    expect(typeof ev.fields.amount).toBe('string')
+  })
+
+  it('falls back to an empty fields map for an unknown symbol, but keeps the raw data', () => {
+    const data = tuple(nativeToScVal(1, { type: 'u32' }))
+    const ev = decodeEvent(makeEvent('totally_unknown_symbol', data))
+    expect(ev.fields).toEqual({})
+    expect(ev.data).toEqual([1])
+  })
+
+  it('decodes unit-value (no-data) admin events without throwing', () => {
+    const ev = decodeEvent(makeEvent('paused'))
+    expect(ev.symbol).toBe('paused')
+    expect(EVENT_FIELDS.paused).toEqual([])
+  })
+
+  it('every ADMIN_EVENT_SYMBOLS entry is present in EVENT_FIELDS', () => {
+    for (const sym of ADMIN_EVENT_SYMBOLS) {
+      expect(Object.prototype.hasOwnProperty.call(EVENT_FIELDS, sym)).toBe(true)
+    }
+  })
+})
+
+describe('toJsonSafe', () => {
+  it('stringifies bigints recursively, including inside arrays and objects', () => {
+    expect(toJsonSafe(42n)).toBe('42')
+    expect(toJsonSafe([1n, 'x', { a: 2n }])).toEqual(['1', 'x', { a: '2' }])
+  })
+
+  it('passes non-bigint primitives through untouched', () => {
+    expect(toJsonSafe('hi')).toBe('hi')
+    expect(toJsonSafe(true)).toBe(true)
+    expect(toJsonSafe(null)).toBe(null)
+  })
+})
