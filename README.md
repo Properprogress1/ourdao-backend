@@ -15,7 +15,7 @@ Soroban RPC ──getEvents──▶ indexer (worker.ts) ──▶ Postgres ─�
 ```
 
 - **`src/indexer`** — a poll loop over the Soroban RPC `getEvents`, resuming from a persisted cursor. Each event is written to an append-only `events` log and folded into derived tables (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) inside one transaction.
-- **`src/stellar/events.ts`** — the event catalog: the exact topic-symbol → data-tuple mapping published by the contract (`joined`, `loan_req`, `loan_vote`, `tre_exec`, `staked`, …), decoded with `scValToNative`.
+- **`src/stellar/events.ts`** — the event catalog: the exact topic-symbol → data-tuple mapping published by the contract (`joined`, `loan_req`, `loan_vote`, `loan_dflt`, `tre_exec`, `staked`, …), decoded with `scValToNative`.
 - **`src/api`** — a [Fastify](https://fastify.dev) server exposing the read endpoints below.
 
 The API process and the indexer worker are separate entrypoints so they can be scaled/deployed independently, but both apply the schema on boot.
@@ -73,7 +73,7 @@ Base path: `/api`
 | `GET /api/members` | Active members. |
 | `GET /api/members/:address` | Single member. |
 | `GET /api/proposals/loan` | Loan proposals with vote tallies. |
-| `GET /api/loans` | Loans (optional `?borrower=`, `?before=<id>`). |
+| `GET /api/loans` | Loans (optional `?borrower=`, `?before=<id>`). `status` is `active`, `repaid`, or `defaulted` — a loan is marked defaulted once it's past due plus the policy's grace period (permissionless on-chain, see `ourdao-contracts`). |
 | `GET /api/loans/:id` | Single loan. |
 | `GET /api/proposals/treasury` | Treasury proposals with vote tallies. |
 | `GET /api/notifications?address=` | Notifications for an address. |
