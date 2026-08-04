@@ -1,0 +1,118 @@
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { PoolClient } from 'pg'
+import { pool, query } from '../src/db/index.js'
+import { applyEvent } from '../src/indexer/handlers.js'
+import { closeDb, resetDb } from './db.js'
+import { decodedEvent } from './fixtures.js'
+import type { LoanProposalRow, LoanRow, MemberRow } from '../src/types.js'
+
+describe('indexer handlers: loans', () => {
+  let client: PoolClient
+
+  beforeEach(async () => {
+    await resetDb()
+    client = await pool.connect()
+  })
+  afterEach(() => client.release())
+  afterAll(closeDb)
+
+  it('loan_req creates a pending proposal and notifies the borrower', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 1, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 1')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.status).toBe('pending')
+    expect(rows[0]?.amount).toBe('1000')
+    expect(rows[0]?.total_repayment).toBe('1100')
+    expect(rows[0]?.votes_for).toBe(0)
+  })
+
+  it('loan_edit updates the amount and total_repayment on an existing proposal', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 2, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(
+      client,
+      decodedEvent('loan_edit', { proposal_id: 2, borrower: 'GBORROWER', new_amount: '2000', total_repayment: '2200' })
+    )
+    const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 2')
+    expect(rows[0]?.amount).toBe('2000')
+    expect(rows[0]?.total_repayment).toBe('2200')
+  })
+
+  it('loan_vote tallies for- and against-votes on the right proposal', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 3, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 3, voter: 'GV1', support: true }))
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 3, voter: 'GV2', support: true }))
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 3, voter: 'GV3', support: false }))
+
+    const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 3')
+    expect(rows[0]?.votes_for).toBe(2)
+    expect(rows[0]?.votes_against).toBe(1)
+  })
+
+  it('loan_appr marks the proposal approved, opens a loan, and flags the borrower as having an active loan', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 4, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_appr', { id: 4, borrower: 'GBORROWER', amount: '1000' }))
+
+    const proposals = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 4')
+    expect(proposals[0]?.status).toBe('approved')
+
+    const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 4')
+    expect(loans).toHaveLength(1)
+    expect(loans[0]?.outstanding).toBe('1000')
+    expect(loans[0]?.status).toBe('active')
+
+    const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
+    expect(members[0]?.has_active_loan).toBe(true)
+  })
+
+  it('loan_rpy with zero outstanding marks the loan repaid and clears has_active_loan', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 5, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_appr', { id: 5, borrower: 'GBORROWER', amount: '1000' }))
+    await applyEvent(client, decodedEvent('loan_rpy', { loan_id: 5, borrower: 'GBORROWER', outstanding: '0' }))
+
+    const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 5')
+    expect(loans[0]?.status).toBe('repaid')
+
+    const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
+    expect(members[0]?.has_active_loan).toBe(false)
+  })
+
+  it('loan_rpy with remaining outstanding keeps the loan active', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 6, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_appr', { id: 6, borrower: 'GBORROWER', amount: '1000' }))
+    await applyEvent(client, decodedEvent('loan_rpy', { loan_id: 6, borrower: 'GBORROWER', outstanding: '400' }))
+
+    const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 6')
+    expect(loans[0]?.status).toBe('active')
+    expect(loans[0]?.outstanding).toBe('400')
+
+    const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
+    expect(members[0]?.has_active_loan).toBe(true)
+  })
+
+  it('interest is a documented no-op (no per-member payload to apply)', async () => {
+    await expect(
+      applyEvent(client, decodedEvent('interest', { interest: '500', active: 10 }))
+    ).resolves.toBeUndefined()
+  })
+})
