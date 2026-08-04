@@ -14,6 +14,7 @@ export const EVENT_FIELDS = {
   loan_vote: ['proposal_id', 'voter', 'support'],
   loan_appr: ['id', 'borrower', 'amount'],
   loan_rpy: ['loan_id', 'borrower', 'outstanding'],
+  loan_dflt: ['loan_id', 'borrower', 'penalty'],
   interest: ['interest', 'active'],
   tre_prop: ['id', 'amount', 'destination', 'private'],
   tre_vote: ['id', 'voter', 'support'],
