@@ -3,7 +3,7 @@
 // consumes, but represent large integers as strings so they survive JSON.
 
 export type LoanProposalStatus = 'pending' | 'approved' | 'rejected' | 'cancelled'
-export type LoanStatus = 'active' | 'repaid'
+export type LoanStatus = 'active' | 'repaid' | 'defaulted'
 export type TreasuryProposalStatus = 'pending' | 'executed' | 'rejected'
 
 export interface MemberRow {
@@ -40,6 +40,7 @@ export interface LoanRow {
   status: LoanStatus
   approved_ledger: number | null
   repaid_ledger: number | null
+  defaulted_ledger: number | null
   updated_at: string
 }
 
