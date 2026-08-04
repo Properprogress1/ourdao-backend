@@ -6,3 +6,8 @@
 // setupFiles.
 process.env.DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://ourdao:ourdao@localhost:5432/ourdao_test'
+
+// buildServer() (src/api/server.ts) reads this to configure its Fastify
+// logger. Route tests build a real server per-test, so leaving it at the
+// 'info' default would drown test output in per-request log lines.
+process.env.LOG_LEVEL ??= 'silent'
