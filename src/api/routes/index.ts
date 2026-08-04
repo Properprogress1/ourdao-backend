@@ -47,14 +47,26 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return query<LoanProposalRow>('SELECT * FROM loan_proposals ORDER BY id DESC LIMIT $1', [l])
   })
 
-  // --- Loans (with optional ?borrower= filter) ---
+  // --- Loans (optional ?borrower= filter, ?before=<id> cursor) ---
   app.get('/loans', async (req) => {
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
-    if (typeof q.borrower === 'string' && q.borrower) {
-      return query<LoanRow>('SELECT * FROM loans WHERE borrower = $1 ORDER BY id DESC LIMIT $2', [q.borrower, l])
+    const before = cursor(q.before)
+    const borrower = typeof q.borrower === 'string' && q.borrower ? q.borrower : null
+
+    const conditions: string[] = []
+    const params: unknown[] = []
+    if (borrower) {
+      params.push(borrower)
+      conditions.push(`borrower = $${params.length}`)
     }
-    return query<LoanRow>('SELECT * FROM loans ORDER BY id DESC LIMIT $1', [l])
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`id < $${params.length}`)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    params.push(l)
+    return query<LoanRow>(`SELECT * FROM loans ${where} ORDER BY id DESC LIMIT $${params.length}`, params)
   })
 
   app.get<{ Params: { id: string } }>('/loans/:id', async (req, reply) => {
