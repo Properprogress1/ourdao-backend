@@ -110,6 +110,23 @@ describe('indexer handlers: loans', () => {
     expect(members[0]?.has_active_loan).toBe(true)
   })
 
+  it('loan_dflt marks the loan defaulted, clears has_active_loan, and records defaulted_ledger', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 7, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_appr', { id: 7, borrower: 'GBORROWER', amount: '1000' }))
+    await applyEvent(client, decodedEvent('loan_dflt', { loan_id: 7, borrower: 'GBORROWER', penalty: '200' }))
+
+    const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 7')
+    expect(loans[0]?.status).toBe('defaulted')
+    expect(loans[0]?.defaulted_ledger).not.toBeNull()
+
+    const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
+    expect(members[0]?.has_active_loan).toBe(false)
+  })
+
   it('interest is a documented no-op (no per-member payload to apply)', async () => {
     await expect(
       applyEvent(client, decodedEvent('interest', { interest: '500', active: 10 }))
