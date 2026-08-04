@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS loans (
   status         TEXT NOT NULL DEFAULT 'active',
   approved_ledger BIGINT,
   repaid_ledger  BIGINT,
+  defaulted_ledger BIGINT,
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS loans_borrower_idx ON loans (borrower);
