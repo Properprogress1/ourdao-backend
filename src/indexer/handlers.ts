@@ -147,6 +147,25 @@ const handlers: Record<string, Handler> = {
     await notify(client, ev, addr(f.borrower), type, 'Loan repayment', msg)
   },
 
+  async loan_dflt(client, ev) {
+    const f = ev.fields
+    const id = num(f.loan_id)
+    const borrower = addr(f.borrower)
+    await client.query(
+      `UPDATE loans SET status = 'defaulted', defaulted_ledger = $2, updated_at = now() WHERE id = $1`,
+      [id, ev.ledger]
+    )
+    await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [borrower])
+    await notify(
+      client,
+      ev,
+      borrower,
+      'error',
+      'Loan defaulted',
+      `Loan #${str(id)} was marked defaulted; a penalty of ${str(f.penalty)} was applied to your contribution.`
+    )
+  },
+
   async interest() {
     // Interest distribution is a treasury-wide event with no per-member payload;
     // it is retained in the raw `events` table. Per-member yield is surfaced via
