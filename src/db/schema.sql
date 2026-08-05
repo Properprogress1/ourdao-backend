@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS loan_proposals (
 );
 CREATE INDEX IF NOT EXISTS loan_proposals_borrower_idx ON loan_proposals (borrower);
 
+-- `id` doubles as the originating loan_proposals.id: the contract reuses the
+-- proposal's own id for the disbursed loan (see ourdao-contracts'
+-- loans.rs::approve_and_disburse) rather than a separate counter, since a
+-- proposal produces at most one loan.
 CREATE TABLE IF NOT EXISTS loans (
   id             INTEGER PRIMARY KEY,
   borrower       TEXT NOT NULL,

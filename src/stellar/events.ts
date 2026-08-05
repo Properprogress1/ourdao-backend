@@ -12,6 +12,12 @@ export const EVENT_FIELDS = {
   loan_req: ['id', 'borrower', 'amount', 'total_repayment'],
   loan_edit: ['proposal_id', 'borrower', 'new_amount', 'total_repayment'],
   loan_vote: ['proposal_id', 'voter', 'support'],
+  // `id` here is the disbursed loan's id, which the contract deliberately
+  // reuses as the originating proposal's id (loans.rs::approve_and_disburse
+  // sets `id = proposal.id` rather than drawing from a separate counter) —
+  // a proposal produces at most one loan, so this is a real invariant, not
+  // a coincidence. The loan_appr handler below relies on it to update both
+  // loan_proposals and loans with the same `id`.
   loan_appr: ['id', 'borrower', 'amount'],
   loan_rpy: ['loan_id', 'borrower', 'outstanding'],
   loan_dflt: ['loan_id', 'borrower', 'penalty'],
