@@ -1,12 +1,34 @@
 # OurDAO Backend
 
 [![CI](https://github.com/ourdao/ourdao-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/ourdao/ourdao-backend/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 Off-chain **indexer + read API** for the [OurDAO](https://github.com/ourdao) lending DAO on Stellar/Soroban.
 
-The Soroban contract (`ourdao-contracts`) is the source of truth for all state, but on-chain data has [state expiration (TTL)](https://developers.stellar.org/docs/learn/encyclopedia/storage/state-archival) and keeps no queryable history. This service fills that gap: it tails the contract's emitted events into Postgres and serves fast, aggregated, history-aware read APIs that the frontend (`ourdao-frontend`) consumes.
+The Soroban contract ([`ourdao-contracts`](https://github.com/ourdao/ourdao-contracts)) is the single source of truth for all state, but on-chain data has [state expiration (TTL)](https://developers.stellar.org/docs/learn/encyclopedia/storage/state-archival) and keeps no queryable history — there's no way to ask the contract "list every loan proposal" or "show me this address's notification feed." This service fills that gap: it tails the contract's emitted events into Postgres and serves fast, aggregated, history-aware read APIs that [`ourdao-frontend`](https://github.com/ourdao/ourdao-frontend) consumes.
 
-It is **strictly read-only and event-driven** — it never holds keys and never signs. Every state change still happens on-chain via the user's wallet.
+It is **strictly read-only and event-driven** — it never holds keys, never signs a transaction, and cannot move funds. Every state change still happens on-chain via the user's own wallet; this service only mirrors what already happened.
+
+This repository is one of three that make up OurDAO:
+
+| Repo | Role |
+|---|---|
+| [`ourdao-contracts`](https://github.com/ourdao/ourdao-contracts) | The Soroban contract — the single source of truth for all DAO state |
+| **`ourdao-backend`** (this repo) | Off-chain indexer + read API |
+| [`ourdao-frontend`](https://github.com/ourdao/ourdao-frontend) | Next.js web app members actually use |
+
+## Table of contents
+
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Database schema](#database-schema)
+- [Event catalog](#event-catalog)
+- [API reference](#api-reference)
+- [Testing](#testing)
+- [Security notes](#security-notes)
+- [Status](#status)
+- [License](#license)
 
 ## Architecture
 
@@ -14,11 +36,12 @@ It is **strictly read-only and event-driven** — it never holds keys and never 
 Soroban RPC ──getEvents──▶ indexer (worker.ts) ──▶ Postgres ──▶ REST API (index.ts) ──▶ frontend
 ```
 
-- **`src/indexer`** — a poll loop over the Soroban RPC `getEvents`, resuming from a persisted cursor. Each event is written to an append-only `events` log and folded into derived tables (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) inside one transaction.
-- **`src/stellar/events.ts`** — the event catalog: the exact topic-symbol → data-tuple mapping published by the contract (`joined`, `loan_req`, `loan_vote`, `loan_dflt`, `tre_exec`, `staked`, …), decoded with `scValToNative`.
-- **`src/api`** — a [Fastify](https://fastify.dev) server exposing the read endpoints below.
+- **`src/indexer`** — a poll loop over the Soroban RPC `getEvents`, resuming from a persisted cursor (`indexer_cursor` table) rather than re-scanning from genesis on every restart. Each raw event is written to an append-only `events` log, then folded into the relevant derived table (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) inside a single database transaction, so a crash mid-poll can never leave the derived tables and the raw log inconsistent. Poll failures back off exponentially (capped, configurable) instead of hammering the RPC endpoint.
+- **`src/stellar/events.ts`** — the event catalog: the exact topic-symbol → data-tuple mapping the contract publishes, decoded via `scValToNative` and converted to JSON-safe primitives (bigints become strings, since JSON has no native 128-bit integer type).
+- **`src/api`** — a [Fastify](https://fastify.dev) server exposing the read endpoints in the [API reference](#api-reference) below.
+- **`src/db`** — the Postgres schema (applied idempotently on boot by both the API and worker processes) and a thin query helper over [`pg`](https://node-postgres.com/).
 
-The API process and the indexer worker are separate entrypoints so they can be scaled/deployed independently, but both apply the schema on boot.
+The API process and the indexer worker are separate entrypoints (`index.ts` / `worker.ts`) so they can be scaled or deployed independently — e.g. one long-running indexer worker behind several stateless, horizontally-scaled API instances.
 
 ## Quick start
 
@@ -26,7 +49,7 @@ The API process and the indexer worker are separate entrypoints so they can be s
 # 1. Install
 npm install
 
-# 2. Start Postgres (or point DATABASE_URL at your own)
+# 2. Start Postgres (or point DATABASE_URL at your own instance)
 docker compose up -d
 
 # 3. Configure
@@ -44,45 +67,89 @@ Production build:
 
 ```bash
 npm run build
-npm start          # API
+npm start              # API
 npm run start:worker   # indexer
 ```
 
 ## Configuration
 
-See [`.env.example`](./.env.example). Key values:
+All configuration is environment-driven — see [`.env.example`](./.env.example) for the full annotated list. Key values:
 
 | Variable | Purpose |
 |---|---|
-| `CONTRACT_ID` | Deployed OurDAO contract id. **Required** for the indexer. |
+| `CONTRACT_ID` | Deployed OurDAO contract id. **Required** for the indexer to run. |
 | `SOROBAN_RPC_URL` | Soroban RPC endpoint (defaults to public testnet). |
 | `NETWORK_PASSPHRASE` | Testnet by default; switch for mainnet. |
-| `DATABASE_URL` | Postgres connection string (or use `PG*` vars). |
-| `START_LEDGER` | Ledger to index from on a cold start (`0` = recent window). |
-| `POLL_INTERVAL_MS` | How often to poll `getEvents`. |
+| `DATABASE_URL` | Postgres connection string (or set the individual `PG*` vars). |
+| `START_LEDGER` / `START_LOOKBACK_LEDGERS` | Where to start indexing on a cold start. Public Soroban RPC only retains ~24h of events, so an old start ledger gets clamped to the oldest the RPC still serves. |
+| `POLL_INTERVAL_MS` / `EVENTS_PAGE_LIMIT` | Indexer poll cadence and page size. |
 | `POLL_MAX_BACKOFF_MS` | Cap for exponential backoff after consecutive poll failures (default 60s). |
+| `CORS_ORIGIN` | Comma-separated allowed origins for the API (the frontend's URL). |
+| `TEST_DATABASE_URL` | Separate database `npm test` runs against — never the dev DB. |
 
-## API
+## Database schema
 
-Base path: `/api`
+Postgres, applied idempotently (`CREATE TABLE IF NOT EXISTS`) by `src/db/migrate.ts` on every boot — no separate migration-runner step needed for this project's current stage.
+
+| Table | Purpose | Notable columns |
+|---|---|---|
+| `indexer_cursor` | Single-row resume state for the poll loop | `paging_token`, `last_ledger` |
+| `events` | Append-only raw event log — the source everything else is derived from | `symbol`, `topics` (JSONB), `data` (JSONB), `tx_hash` |
+| `members` | Current membership state | `contribution`, `stake`, `has_active_loan`, `pending_claimed`, `name` (from the registry) |
+| `loan_proposals` | Loan votes in flight | `status` (`pending`/`approved`/`rejected`), `votes_for`, `votes_against` |
+| `loans` | Disbursed loans | `status` (`active`/`repaid`/`defaulted`), `outstanding`. **`id` doubles as the originating `loan_proposals.id`** — the contract reuses the proposal's own id for the disbursed loan rather than a separate counter, since a proposal produces at most one loan. |
+| `treasury_proposals` | Treasury withdrawal votes | `private` (routed through commit-reveal instead of open voting), `status` |
+| `notifications` | Per-address notification feed | `type`, `read`, indexed on `(address, read)` |
+
+On-chain `i128` amounts are stored as `NUMERIC(40,0)` (an i128's max value is ~1.7×10³⁸, which fits under 10³⁹) and returned from the API as **decimal strings**, never JSON numbers, to avoid silent precision loss — this was in fact a real bug found and fixed during development: `pg` returns Postgres `BIGINT` columns as JS strings by default, and the original code assumed they came back as numbers.
+
+## Event catalog
+
+The full topic-symbol → data-tuple mapping this service decodes (kept in sync with `ourdao-contracts`'s `env.events().publish(...)` calls):
+
+| Symbol | Fields | Derived-table effect |
+|---|---|---|
+| `joined` | `member, fee` | upserts `members`, notifies the member |
+| `exited` | `member, share` | marks the member exited |
+| `claimed` | `member, pending` | tracks claimed yield |
+| `loan_req` | `id, borrower, amount, total_repayment` | inserts a pending `loan_proposals` row |
+| `loan_edit` | `proposal_id, borrower, new_amount, total_repayment` | updates the proposal |
+| `loan_vote` | `proposal_id, voter, support` | increments the vote tally |
+| `loan_appr` | `id, borrower, amount` | marks the proposal approved, opens a `loans` row, flags the borrower's `has_active_loan` |
+| `loan_rpy` | `loan_id, borrower, outstanding` | updates outstanding balance; marks `repaid` when it hits zero |
+| `loan_dflt` | `loan_id, borrower, penalty` | marks the loan `defaulted`, clears the borrower's `has_active_loan` |
+| `interest` | `interest, active` | no per-member payload — retained in the raw event log only |
+| `tre_prop` | `id, amount, destination, private` | inserts a pending `treasury_proposals` row |
+| `tre_vote` | `id, voter, support` | increments the vote tally |
+| `tre_exec` | `id, amount, destination` | marks the proposal executed, notifies the recipient |
+| `staked` / `unstaked` | `member, amount, new_stake` | updates the member's stake |
+| `name_reg` | `name, owner` | updates the member's registered name |
+| `committed` | `proposal_id, voter` | notifies the voter their commit was recorded |
+| `revealed` | `proposal_id, voter, support` | tallies the same as an open vote |
+| `doc_attn` | `kind, proposal_id, caller` | (raw log only — the content hash itself is read live from the contract, not indexed) |
+| `init`, `admin_add`, `admin_rem`, `threshold`, `policy`, `paused`, `unpaused` | varies | admin/governance events — surfaced via `/api/admin/log`, not folded into a derived table |
+
+## API reference
+
+Base path: `/api`.
 
 | Method & path | Description |
 |---|---|
-| `GET /health` | Liveness + configured contract id. |
-| `GET /api/stats` | Aggregate counts + last indexed ledger. |
+| `GET /health` | Liveness check + the currently configured contract id. |
+| `GET /api/stats` | Aggregate counts (members, loans, proposals) + the last indexed ledger. |
 | `GET /api/members` | Active members. |
 | `GET /api/members/:address` | Single member. |
 | `GET /api/proposals/loan` | Loan proposals with vote tallies. |
-| `GET /api/loans` | Loans (optional `?borrower=`, `?before=<id>`). `status` is `active`, `repaid`, or `defaulted` — a loan is marked defaulted once it's past due plus the policy's grace period (permissionless on-chain, see `ourdao-contracts`). |
+| `GET /api/loans` | Loans. Optional `?borrower=`, `?before=<id>` for pagination. `status` is `active`, `repaid`, or `defaulted` — a loan is marked defaulted once it's past due plus the policy's grace period (permissionless on-chain, see `ourdao-contracts`). |
 | `GET /api/loans/:id` | Single loan. |
 | `GET /api/proposals/treasury` | Treasury proposals with vote tallies. |
 | `GET /api/notifications?address=` | Notifications for an address. |
 | `PATCH /api/notifications/:id/read` | Mark one notification read. |
 | `PATCH /api/notifications/read-all?address=` | Mark every unread notification for an address read. |
-| `GET /api/events` | Raw event feed (optional `?symbol=`, `?before=<ledger>`). |
-| `GET /api/admin/log` | Admin/governance audit trail (init, admin add/remove, threshold, policy, pause/unpause). |
+| `GET /api/events` | Raw event feed. Optional `?symbol=`, `?before=<ledger>`. |
+| `GET /api/admin/log` | Admin/governance audit trail — init, admin add/remove, threshold changes, policy changes, pause/unpause. |
 
-All list endpoints accept `?limit=` (default 50, max 200). `?before=` is a cursor — pass the `id`/`ledger` of the last row you saw to page further back. On-chain `i128` amounts are returned as decimal **strings** to preserve precision; ledger sequence numbers are returned as regular JSON numbers.
+All list endpoints accept `?limit=` (default 50, max 200). `?before=` is a cursor: pass the `id`/`ledger` of the last row you saw to page further back. On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
 
 ## Testing
 
@@ -95,11 +162,27 @@ npm run lint
 npm run typecheck
 ```
 
-Tests apply the real `schema.sql` and truncate between runs (see `test/db.ts`); route tests build a real Fastify instance and exercise it with `inject()` rather than mocking. CI runs all of this (plus `npm run build`) against a Postgres service container on every push/PR.
+48 tests across 8 files, covering:
+- Event decode logic (`decodeEvent`, `toJsonSafe`) in isolation.
+- Every indexer handler (membership, loan lifecycle including defaults, treasury, staking, registry, commit-reveal privacy) against a real Postgres instance — not mocked.
+- Every API route, exercised through a real Fastify instance via `.inject()`.
+
+Tests apply the real `schema.sql` and truncate all tables between runs (`test/db.ts`). CI runs all of the above plus `npm run build` against a Postgres service container on every push and PR (`.github/workflows/ci.yml`).
+
+## Security notes
+
+- **No custody, ever.** This service holds no private keys and has no code path that constructs, signs, or submits a transaction. It is a read model over public on-chain events.
+- **Fail-soft, not fail-open.** If the indexer falls behind or the RPC endpoint is unreachable, reads degrade to stale/empty data (surfaced to the frontend as such) rather than the API crashing or serving incorrect state.
+- **CORS is explicit.** `CORS_ORIGIN` defaults to `http://localhost:3000` in the example config — a production deployment should set this to the real frontend origin rather than `*`.
+- **Input handling.** All route parameters (addresses, ids, cursors) are validated before being used in parameterized queries — no raw string interpolation into SQL anywhere in the codebase.
 
 ## Status
 
-MVP — the indexer and read API are implemented for the full event catalog, with test coverage across the indexer handlers and API routes. Planned next: IPFS pinning for document metadata and commit-reveal ballot coordination for private voting (both frontend/contract-facing), and indexer reorg handling.
+MVP — the indexer and read API are implemented for the full event catalog, including loan defaults, with test coverage across every indexer handler and API route. Known gaps:
+
+- No reorg handling — Soroban/Stellar finality makes deep reorgs very unlikely in practice, but the indexer doesn't currently detect or recover from one if it happened.
+- Single indexer instance — no leader-election or multi-instance coordination if you wanted to run more than one worker for redundancy.
+- IPFS pinning for document metadata is a frontend/contract-facing concern (`ourdao-frontend`'s `lib/ipfs.ts`), not something this service indexes today beyond the raw `doc_attn` event.
 
 ## License
 
