@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="OurDAO logo" width="96" />
+</p>
+
 # OurDAO Backend
 
 [![CI](https://github.com/ourdao/ourdao-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/ourdao/ourdao-backend/actions/workflows/ci.yml)
