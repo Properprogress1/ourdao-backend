@@ -32,6 +32,7 @@ This repository is one of three that make up OurDAO:
 - [Testing](#testing)
 - [Security notes](#security-notes)
 - [Status](#status)
+- [Contributing](#contributing)
 - [License](#license)
 
 ## Architecture
@@ -187,6 +188,12 @@ MVP — the indexer and read API are implemented for the full event catalog, inc
 - No reorg handling — Soroban/Stellar finality makes deep reorgs very unlikely in practice, but the indexer doesn't currently detect or recover from one if it happened.
 - Single indexer instance — no leader-election or multi-instance coordination if you wanted to run more than one worker for redundancy.
 - IPFS pinning for document metadata is a frontend/contract-facing concern (`ourdao-frontend`'s `lib/ipfs.ts`), not something this service indexes today beyond the raw `doc_attn` event.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) for local setup, how to run the test suite against a real Postgres, and the backend-specific rules (read-only boundary, append-only event log, transactional event folding). Please claim an issue before opening a pull request.
+
+Found a security vulnerability? Don't open a public issue — use GitHub's private vulnerability reporting on this repo.
 
 ## License
 
