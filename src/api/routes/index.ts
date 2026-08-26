@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { query, queryOne } from '../../db/index.js'
+import { config } from '../../config.js'
 import { ADMIN_EVENT_SYMBOLS } from '../../stellar/events.js'
 import type {
   DAOStats,
@@ -95,7 +96,15 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   })
 
   // --- Raw event feed (optional ?symbol= filter, ?before=<ledger> cursor) ---
-  app.get('/events', async (req) => {
+  // Stricter rate limit on this heavy endpoint (issue #5).
+  app.get('/events', {
+    config: {
+      rateLimit: {
+        max: config.http.rateLimitEventsMax,
+        timeWindow: config.http.rateLimitWindowMs,
+      },
+    },
+  }, async (req) => {
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
     const before = cursor(q.before)
@@ -156,7 +165,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     )
   })
 
-  // --- Aggregate stats ---
+  // --- Aggregate stats (with indexer freshness — issue #2) ---
   app.get('/stats', async (): Promise<DAOStats> => {
     const row = await queryOne<{
       total_members: string
@@ -167,6 +176,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       total_treasury_proposals: string
       total_staked: string | null
       last_ledger: number | null
+      cursor_updated_at: string | null
     }>(
       `SELECT
          (SELECT count(*) FROM members WHERE exited = false)                       AS total_members,
@@ -176,8 +186,16 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
          (SELECT count(*) FROM loans WHERE status = 'active')                      AS active_loans,
          (SELECT count(*) FROM treasury_proposals)                                 AS total_treasury_proposals,
          (SELECT COALESCE(sum(stake), 0) FROM members)                             AS total_staked,
-         (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger`
+         (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
+         (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at`
     )
+    const lastLedger = row?.last_ledger ?? null
+    const cursorUpdatedAt = row?.cursor_updated_at
+    const secondsSinceUpdate = cursorUpdatedAt
+      ? Math.floor((Date.now() - new Date(cursorUpdatedAt).getTime()) / 1000)
+      : null
+    const isStale = secondsSinceUpdate !== null && secondsSinceUpdate > config.indexer.staleAfterMs
+
     return {
       totalMembers: Number(row?.total_members ?? 0),
       activeMembers: Number(row?.active_members ?? 0),
@@ -186,7 +204,9 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       activeLoans: Number(row?.active_loans ?? 0),
       totalTreasuryProposals: Number(row?.total_treasury_proposals ?? 0),
       totalStaked: String(row?.total_staked ?? '0'),
-      lastIndexedLedger: row?.last_ledger ?? null,
+      lastIndexedLedger: lastLedger,
+      secondsSinceUpdate,
+      indexerStale: isStale,
     }
   })
 }

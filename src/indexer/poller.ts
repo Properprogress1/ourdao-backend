@@ -25,6 +25,11 @@ async function saveCursor(pagingToken: string | null, lastLedger: number): Promi
   )
 }
 
+/** Touch updated_at without changing data — keeps freshness signal alive on idle contracts. */
+async function touchCursor(): Promise<void> {
+  await pool.query('UPDATE indexer_cursor SET updated_at = now() WHERE id = 1')
+}
+
 /** Determine the ledger to start from on a cold start (no saved cursor). */
 async function resolveStartLedger(): Promise<number> {
   if (config.indexer.startLedger > 0) return config.indexer.startLedger
@@ -58,10 +63,17 @@ async function ingestPage(events: rpc.Api.EventResponse[]): Promise<void> {
   }
 }
 
+/**
+ * Fetch events from the Soroban RPC and ingest them into Postgres.
+ *
+ * Issue #3: drains multiple pages when behind — keeps requesting while the
+ * previous page came back full (events.length === pageLimit), bounded by
+ * DRAIN_MAX_PAGES and DRAIN_MAX_MS. The cursor is advanced after every page
+ * so progress survives a mid-drain crash.
+ */
 async function fetchOnce(contractId: string): Promise<void> {
   const cursor = await loadCursor()
 
-  // getEvents accepts either a cursor (resume) or a startLedger (cold start).
   const base = {
     filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] as string[][] }],
     limit: config.indexer.pageLimit,
@@ -70,23 +82,60 @@ async function fetchOnce(contractId: string): Promise<void> {
     ? { ...base, cursor: cursor.paging_token }
     : { ...base, startLedger: await resolveStartLedger() }
 
-  const res = await server.getEvents(request)
-  const events = res.events ?? []
+  let currentRequest = request
+  let totalPages = 0
+  const drainStart = Date.now()
+  let totalEvents = 0
+  let lastLedger = cursor?.last_ledger ?? 0
 
-  await ingestPage(events)
+  for (;;) {
+    const res = await server.getEvents(currentRequest)
+    const events = res.events ?? []
+    const pageCount = events.length
 
-  // Advance the cursor. Prefer the paging id of the last event; fall back to
-  // the response-level cursor so we keep moving even across empty pages.
-  // (In Soroban RPC an event's `id` is its paging token.)
-  const last = events[events.length - 1]
-  const nextToken = last?.id ?? res.cursor ?? cursor?.paging_token ?? null
-  const lastLedger = last?.ledger ?? res.latestLedger ?? cursor?.last_ledger ?? 0
-  if (nextToken !== cursor?.paging_token || lastLedger !== cursor?.last_ledger) {
-    await saveCursor(nextToken, lastLedger)
+    await ingestPage(events)
+    totalPages += 1
+    totalEvents += pageCount
+
+    // Advance cursor after every page (issue #3: per-page cursor advancement).
+    const last = events[events.length - 1]
+    const nextToken = last?.id ?? res.cursor ?? currentRequest.cursor ?? null
+    const pageLedger = last?.ledger ?? res.latestLedger ?? lastLedger
+    if (nextToken !== cursor?.paging_token || pageLedger !== lastLedger) {
+      await saveCursor(nextToken, pageLedger)
+      lastLedger = pageLedger
+    }
+
+    // Log catch-up progress distinctly from steady-state (issue #3).
+    if (pageCount > 0) {
+      console.log(`[indexer] page ${totalPages}: ingested ${pageCount} event(s) up to ledger ${pageLedger}`)
+    }
+
+    // Stop draining if:
+    //  - short page (tail reached)
+    //  - max pages hit
+    //  - wall-clock budget exhausted
+    const isFullPage = pageCount >= config.indexer.pageLimit
+    const pagesExhausted = totalPages >= config.indexer.maxDrainPages
+    const timeExhausted = Date.now() - drainStart >= config.indexer.maxDrainMs
+
+    if (!isFullPage || pagesExhausted || timeExhausted) {
+      if (pagesExhausted || timeExhausted) {
+        console.log(`[indexer] drain cap reached: ${totalPages} pages, ${totalEvents} events, ${Date.now() - drainStart}ms`)
+      }
+      break
+    }
+
+    // Build next request from the response cursor
+    currentRequest = { ...base, cursor: res.cursor }
   }
 
-  if (events.length > 0) {
-    console.log(`[indexer] ingested ${events.length} event(s) up to ledger ${lastLedger}`)
+  // On a genuinely idle contract with no new events, touch updated_at so
+  // /ready doesn't falsely report stale (issue #2 context note).
+  if (totalEvents === 0) {
+    await touchCursor()
+  } else if (totalPages > 1) {
+    console.log(`[indexer] drain complete: ${totalPages} pages, ${totalEvents} events in ${Date.now() - drainStart}ms`)
   }
 }
 
