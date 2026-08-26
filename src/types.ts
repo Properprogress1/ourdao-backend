@@ -92,4 +92,6 @@ export interface DAOStats {
   totalTreasuryProposals: number
   totalStaked: string
   lastIndexedLedger: number | null
+  secondsSinceUpdate: number | null
+  indexerStale: boolean
 }
