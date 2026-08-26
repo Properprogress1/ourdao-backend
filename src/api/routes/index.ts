@@ -10,6 +10,7 @@ import type {
   TreasuryProposalRow,
   EventRow,
 } from '../../types.js'
+import { authenticateRequest, MemoryNonceStore, extractAuthHeaders } from '../../auth.js'
 
 // Small helper: clamp a `limit` query param to a sane range.
 function limit(v: unknown, def = 50, max = 200): number {
@@ -25,7 +26,24 @@ function cursor(v: unknown): number | null {
   return Number.isFinite(n) ? n : null
 }
 
-export async function registerRoutes(app: FastifyInstance): Promise<void> {
+export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: MemoryNonceStore }): Promise<void> {
+  const { nonceStore } = opts
+  
+  // --- Authentication challenge ---
+  app.get<{ Querystring: { address: string } }>('/auth/challenge', async (req, reply) => {
+    const { address } = req.query
+    if (!address) {
+      return reply.code(400).send({ error: 'address query param is required' })
+    }
+    
+    try {
+      const nonce = await nonceStore.issue(address)
+      return { nonce }
+    } catch (error) {
+      return reply.code(500).send({ error: 'Failed to generate challenge' })
+    }
+  })
+  
   // --- Members ---
   app.get('/members', async (req) => {
     const l = limit((req.query as Record<string, unknown>).limit)
@@ -121,10 +139,30 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
   // --- Mark a single notification as read ---
   app.patch<{ Params: { id: string } }>('/notifications/:id/read', async (req, reply) => {
+    // First authenticate the request
+    const auth = await authenticateRequest(req.headers, nonceStore)
+    if (!auth.authenticated) {
+      return reply.code(401).send({ error: auth.error || 'Authentication required' })
+    }
+    
     const id = Number(req.params.id)
     if (!Number.isFinite(id)) {
       return reply.code(400).send({ error: 'invalid notification id' })
     }
+    
+    // Get the notification to check ownership
+    const notification = await queryOne<NotificationRow>(
+      'SELECT * FROM notifications WHERE id = $1',
+      [id]
+    )
+    if (!notification) return reply.code(404).send({ error: 'notification not found' })
+    
+    // Extract address from auth headers and verify ownership
+    const { address: authAddress } = extractAuthHeaders(req.headers)
+    if (notification.address !== authAddress) {
+      return reply.code(403).send({ error: 'Cannot modify notifications for another address' })
+    }
+    
     const row = await queryOne<NotificationRow>(
       'UPDATE notifications SET read = true WHERE id = $1 RETURNING *',
       [id]
@@ -139,6 +177,13 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     if (typeof q.address !== 'string' || !q.address) {
       return reply.code(400).send({ error: 'address query param is required' })
     }
+    
+    // Authenticate the request and verify the address matches
+    const auth = await authenticateRequest(req.headers, nonceStore, q.address)
+    if (!auth.authenticated) {
+      return reply.code(401).send({ error: auth.error || 'Authentication required' })
+    }
+    
     const rows = await query<NotificationRow>(
       'UPDATE notifications SET read = true WHERE address = $1 AND read = false RETURNING id',
       [q.address]
