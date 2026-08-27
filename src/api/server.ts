@@ -4,6 +4,7 @@ import rateLimit from '@fastify/rate-limit'
 import { config } from '../config.js'
 import { pool } from '../db/index.js'
 import { registerRoutes } from './routes/index.js'
+import { MemoryNonceStore } from '../auth.js'
 
 interface CursorRow {
   last_ledger: number | null
