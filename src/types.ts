@@ -26,8 +26,8 @@ export interface LoanProposalRow {
   amount: string
   total_repayment: string
   status: LoanProposalStatus
-  votes_for: number
-  votes_against: number
+  votes_for: string
+  votes_against: string
   created_ledger: number | null
   updated_at: string
 }
@@ -37,8 +37,10 @@ export interface LoanRow {
   borrower: string
   amount: string
   outstanding: string
+  total_repayment: string
   status: LoanStatus
   approved_ledger: number | null
+  due_time: string | null
   repaid_ledger: number | null
   defaulted_ledger: number | null
   updated_at: string
@@ -50,8 +52,8 @@ export interface TreasuryProposalRow {
   destination: string
   private: boolean
   status: TreasuryProposalStatus
-  votes_for: number
-  votes_against: number
+  votes_for: string
+  votes_against: string
   created_ledger: number | null
   executed_ledger: number | null
   updated_at: string

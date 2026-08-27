@@ -8,20 +8,29 @@ import { applyEvent } from './handlers.js'
 interface CursorRow {
   paging_token: string | null
   last_ledger: number | null
+  contract_id: string | null
 }
 
 let stopped = false
 
-async function loadCursor(): Promise<CursorRow | null> {
-  return queryOne<CursorRow>('SELECT paging_token, last_ledger FROM indexer_cursor WHERE id = 1')
+/** Loads the saved cursor, but only if it belongs to `contractId` — a
+ *  cursor saved under a different contract (CONTRACT_ID changed since the
+ *  last run) is treated as absent so the indexer cold-starts instead of
+ *  resuming with another contract's paging_token. */
+async function loadCursor(contractId: string): Promise<CursorRow | null> {
+  const row = await queryOne<CursorRow>(
+    'SELECT paging_token, last_ledger, contract_id FROM indexer_cursor WHERE id = 1'
+  )
+  if (row && row.contract_id != null && row.contract_id !== contractId) return null
+  return row
 }
 
-async function saveCursor(pagingToken: string | null, lastLedger: number): Promise<void> {
+async function saveCursor(contractId: string, pagingToken: string | null, lastLedger: number): Promise<void> {
   await pool.query(
-    `INSERT INTO indexer_cursor (id, paging_token, last_ledger, updated_at)
-     VALUES (1, $1, $2, now())
-     ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, updated_at = now()`,
-    [pagingToken, lastLedger]
+    `INSERT INTO indexer_cursor (id, paging_token, last_ledger, contract_id, updated_at)
+     VALUES (1, $1, $2, $3, now())
+     ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, contract_id = $3, updated_at = now()`,
+    [pagingToken, lastLedger, contractId]
   )
 }
 
@@ -72,7 +81,7 @@ async function ingestPage(events: rpc.Api.EventResponse[]): Promise<void> {
  * so progress survives a mid-drain crash.
  */
 async function fetchOnce(contractId: string): Promise<void> {
-  const cursor = await loadCursor()
+  const cursor = await loadCursor(contractId)
 
   const base = {
     filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] as string[][] }],
@@ -102,7 +111,7 @@ async function fetchOnce(contractId: string): Promise<void> {
     const nextToken = last?.id ?? res.cursor ?? currentRequest.cursor ?? null
     const pageLedger = last?.ledger ?? res.latestLedger ?? lastLedger
     if (nextToken !== cursor?.paging_token || pageLedger !== lastLedger) {
-      await saveCursor(nextToken, pageLedger)
+      await saveCursor(contractId, nextToken, pageLedger)
       lastLedger = pageLedger
     }
 

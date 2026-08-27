@@ -26,7 +26,7 @@ describe('indexer handlers: loans', () => {
     expect(rows[0]?.status).toBe('pending')
     expect(rows[0]?.amount).toBe('1000')
     expect(rows[0]?.total_repayment).toBe('1100')
-    expect(rows[0]?.votes_for).toBe(0)
+    expect(rows[0]?.votes_for).toBe('0')
   })
 
   it('loan_edit updates the amount and total_repayment on an existing proposal', async () => {
@@ -53,8 +53,8 @@ describe('indexer handlers: loans', () => {
     await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 3, voter: 'GV3', support: false }))
 
     const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 3')
-    expect(rows[0]?.votes_for).toBe(2)
-    expect(rows[0]?.votes_against).toBe(1)
+    expect(rows[0]?.votes_for).toBe('2')
+    expect(rows[0]?.votes_against).toBe('1')
   })
 
   it('loan_appr marks the proposal approved, opens a loan, and flags the borrower as having an active loan', async () => {
@@ -71,6 +71,7 @@ describe('indexer handlers: loans', () => {
     const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 4')
     expect(loans).toHaveLength(1)
     expect(loans[0]?.outstanding).toBe('1000')
+    expect(loans[0]?.total_repayment).toBe('1100')
     expect(loans[0]?.status).toBe('active')
 
     const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])

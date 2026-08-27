@@ -11,7 +11,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:worker": "tsx watch src/worker.ts",
-    "build": "tsc -p tsconfig.json && cp src/db/schema.sql dist/db/schema.sql",
+    "build": "tsc -p tsconfig.json && cp src/db/schema.sql dist/db/schema.sql && cp -r src/db/migrations dist/db/migrations",
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
     "migrate": "tsx src/db/migrate.ts",

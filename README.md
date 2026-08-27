@@ -101,15 +101,20 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 
 ## Database schema
 
-Postgres, applied idempotently (`CREATE TABLE IF NOT EXISTS`) by `src/db/migrate.ts` on every boot — no separate migration-runner step needed for this project's current stage.
+Postgres, applied by `src/db/migrate.ts` on every boot — both the API and the worker call it at startup, so it's safe with no separate migration-runner step to remember to run.
+
+`src/db/schema.sql` is the bootstrap baseline: idempotent `CREATE TABLE/INDEX IF NOT EXISTS` statements describing the *current* desired shape. That's sufficient for a brand-new database, but `IF NOT EXISTS` silently no-ops on a table that already exists — including when a column was added or a type changed. Those changes instead live as numbered files in `src/db/migrations/` (e.g. `0001_widen_vote_columns.sql`), applied in order and tracked in a `schema_migrations` table so each one runs exactly once per database. A fresh database created from `schema.sql` already has every migration's end state, so its migrations are recorded as applied without re-running their SQL; an existing database gets the real `ALTER` statements. A Postgres advisory lock serializes `migrate()` across the API and worker so they don't race to apply the same migration concurrently on startup.
+
+To add a schema change: update `schema.sql` to the new desired shape (for fresh databases) *and* add a new numbered file under `src/db/migrations/` with the `ALTER`/`CREATE`/etc. needed to get an existing database there (for everyone else).
 
 | Table | Purpose | Notable columns |
 |---|---|---|
-| `indexer_cursor` | Single-row resume state for the poll loop | `paging_token`, `last_ledger` |
+| `schema_migrations` | Tracks which numbered migrations have been applied | `version`, `name`, `applied_at` |
+| `indexer_cursor` | Single-row resume state for the poll loop | `paging_token`, `last_ledger`, `contract_id` (cursor is discarded on a cold start if it belongs to a different contract) |
 | `events` | Append-only raw event log — the source everything else is derived from | `symbol`, `topics` (JSONB), `data` (JSONB), `tx_hash` |
 | `members` | Current membership state | `contribution`, `stake`, `has_active_loan`, `pending_claimed`, `name` (from the registry) |
 | `loan_proposals` | Loan votes in flight | `status` (`pending`/`approved`/`rejected`), `votes_for`, `votes_against` |
-| `loans` | Disbursed loans | `status` (`active`/`repaid`/`defaulted`), `outstanding`. **`id` doubles as the originating `loan_proposals.id`** — the contract reuses the proposal's own id for the disbursed loan rather than a separate counter, since a proposal produces at most one loan. |
+| `loans` | Disbursed loans | `status` (`active`/`repaid`/`defaulted`), `outstanding`, `total_repayment` (carried over from the originating proposal), `due_time`. **`id` doubles as the originating `loan_proposals.id`** — the contract reuses the proposal's own id for the disbursed loan rather than a separate counter, since a proposal produces at most one loan. |
 | `treasury_proposals` | Treasury withdrawal votes | `private` (routed through commit-reveal instead of open voting), `status` |
 | `notifications` | Per-address notification feed | `type`, `read`, indexed on `(address, read)` |
 
