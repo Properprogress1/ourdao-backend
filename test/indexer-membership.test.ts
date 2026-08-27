@@ -34,12 +34,27 @@ describe('indexer handlers: membership', () => {
     expect(notifs[0]?.type).toBe('success')
   })
 
-  it('joining again for the same address adds to contribution instead of replacing it', async () => {
+  it('joining again for the same address replaces contribution rather than accumulating it, matching the contract', async () => {
     await applyEvent(client, decodedEvent('joined', { member: 'GBOB', fee: '100' }))
     await applyEvent(client, decodedEvent('joined', { member: 'GBOB', fee: '50' }))
 
     const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBOB'])
-    expect(rows[0]?.contribution).toBe('150')
+    expect(rows[0]?.contribution).toBe('50')
+  })
+
+  it('a join -> exit -> rejoin sequence leaves contribution at a single fee, with no residue of the previous membership', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GEVE', fee: '100' }))
+    await applyEvent(client, decodedEvent('loan_appr', { id: 900, borrower: 'GEVE', amount: '1' }))
+    await applyEvent(client, decodedEvent('exited', { member: 'GEVE', share: '120' }))
+    await applyEvent(client, decodedEvent('joined', { member: 'GEVE', fee: '100' }))
+
+    const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GEVE'])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.contribution).toBe('100')
+    expect(rows[0]?.exited).toBe(false)
+    expect(rows[0]?.exit_share).toBeNull()
+    expect(rows[0]?.exited_ledger).toBeNull()
+    expect(rows[0]?.has_active_loan).toBe(false)
   })
 
   it('exited marks a member inactive and records their exit share', async () => {

@@ -36,14 +36,22 @@ const handlers: Record<string, Handler> = {
   async joined(client, ev) {
     const f = ev.fields
     const member = addr(f.member)
+    // membership.rs::register_member stores a brand-new Member record on
+    // every join, including a rejoin after exit — contribution is *set* to
+    // the fee, never added to what was there before, and every other bit of
+    // membership state (exited, exit_share, exited_ledger, has_active_loan)
+    // starts fresh too. Mirror that exactly: overwrite, don't accumulate.
     await client.query(
-      `INSERT INTO members (address, joined_ledger, contribution, exited, updated_at)
-       VALUES ($1, $2, $3, false, now())
+      `INSERT INTO members (address, joined_ledger, contribution, exited, exit_share, exited_ledger, has_active_loan, updated_at)
+       VALUES ($1, $2, $3, false, NULL, NULL, false, now())
        ON CONFLICT (address) DO UPDATE
-         SET joined_ledger = EXCLUDED.joined_ledger,
-             contribution  = members.contribution + EXCLUDED.contribution,
-             exited        = false,
-             updated_at    = now()`,
+         SET joined_ledger   = EXCLUDED.joined_ledger,
+             contribution    = EXCLUDED.contribution,
+             exited          = false,
+             exit_share      = NULL,
+             exited_ledger   = NULL,
+             has_active_loan = false,
+             updated_at      = now()`,
       [member, ev.ledger, str(f.fee)]
     )
     await notify(client, ev, member, 'success', 'Welcome to OurDAO', 'Your membership is active.')
