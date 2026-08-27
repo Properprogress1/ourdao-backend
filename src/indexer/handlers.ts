@@ -29,6 +29,20 @@ async function notify(
 
 // Per-event handlers -------------------------------------------------------
 // Each mutates derived tables for one decoded event. `f` is ev.fields.
+//
+// Rule of thumb (see issue #10): a handler must mirror the contract's own
+// state transition for the field it's writing — assign where the contract
+// assigns a fresh value onto the record, accumulate only where the contract
+// itself accumulates. `joined` is the clearest example: register_member
+// builds an entirely new `Member` record on every call, including a rejoin,
+// so the indexer must overwrite rather than add. `claimed`'s `pending_claimed`
+// is different on purpose — it's an indexer-only lifetime counter with no
+// on-chain equivalent to mirror, so accumulating there is correct.
+
+// Contract-published voting weight, once ourdao-contracts adds it to the vote
+// events (see the linked issue there). Until then the field decodes as
+// null/undefined and every vote counts as weight 1, same as before.
+const weightOf = (f: Record<string, unknown>): string => (f.weight == null ? '1' : str(f.weight))
 
 type Handler = (client: PoolClient, ev: DecodedEvent) => Promise<void>
 
@@ -36,14 +50,22 @@ const handlers: Record<string, Handler> = {
   async joined(client, ev) {
     const f = ev.fields
     const member = addr(f.member)
+    // membership.rs::register_member stores a brand-new Member record on
+    // every join, including a rejoin after exit — contribution is *set* to
+    // the fee, never added to what was there before, and every other bit of
+    // membership state (exited, exit_share, exited_ledger, has_active_loan)
+    // starts fresh too. Mirror that exactly: overwrite, don't accumulate.
     await client.query(
-      `INSERT INTO members (address, joined_ledger, contribution, exited, updated_at)
-       VALUES ($1, $2, $3, false, now())
+      `INSERT INTO members (address, joined_ledger, contribution, exited, exit_share, exited_ledger, has_active_loan, updated_at)
+       VALUES ($1, $2, $3, false, NULL, NULL, false, now())
        ON CONFLICT (address) DO UPDATE
-         SET joined_ledger = EXCLUDED.joined_ledger,
-             contribution  = members.contribution + EXCLUDED.contribution,
-             exited        = false,
-             updated_at    = now()`,
+         SET joined_ledger   = EXCLUDED.joined_ledger,
+             contribution    = EXCLUDED.contribution,
+             exited          = false,
+             exit_share      = NULL,
+             exited_ledger   = NULL,
+             has_active_loan = false,
+             updated_at      = now()`,
       [member, ev.ledger, str(f.fee)]
     )
     await notify(client, ev, member, 'success', 'Welcome to OurDAO', 'Your membership is active.')
@@ -101,8 +123,10 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const column = f.support === true ? 'votes_for' : 'votes_against'
     await client.query(
-      `UPDATE loan_proposals SET ${column} = ${column} + 1, updated_at = now() WHERE id = $1`,
-      [num(f.proposal_id)]
+      `UPDATE loan_proposals
+         SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
+       WHERE id = $1`,
+      [num(f.proposal_id), weightOf(f)]
     )
   },
 
@@ -113,12 +137,29 @@ const handlers: Record<string, Handler> = {
       `UPDATE loan_proposals SET status = 'approved', updated_at = now() WHERE id = $1`,
       [id]
     )
+    // `loan_appr` only carries the disbursed principal, not the repayment
+    // total — outstanding debt from day one is total_repayment (principal +
+    // interest), not the principal alone (issue #11). ourdao-contracts
+    // doesn't publish total_repayment on this event, but `loan.id ==
+    // proposal.id` is a documented invariant, so the just-approved proposal
+    // row (already carrying total_repayment from `loan_req`/`loan_edit`) is
+    // a reliable interim source. This depends on that proposal row existing,
+    // which it will unless the indexer started mid-history.
+    const proposal = await client.query<{ total_repayment: string }>(
+      `SELECT total_repayment FROM loan_proposals WHERE id = $1`,
+      [id]
+    )
+    const totalRepayment = proposal.rows[0]?.total_repayment ?? str(f.amount)
+    // due_time is a unix-seconds timestamp on the contract side; convert for
+    // the TIMESTAMPTZ column. Always null today since the event doesn't
+    // carry it yet (see the comment on EVENT_FIELDS.loan_appr).
+    const dueTime = f.due_time == null ? null : new Date(Number(f.due_time) * 1000)
     await client.query(
-      `INSERT INTO loans (id, borrower, amount, outstanding, total_repayment, status, approved_ledger, updated_at)
-       VALUES ($1, $2, $3, $3, COALESCE((SELECT total_repayment FROM loan_proposals WHERE id = $1), 0), 'active', $4, now())
+      `INSERT INTO loans (id, borrower, amount, total_repayment, outstanding, status, approved_ledger, due_time, updated_at)
+       VALUES ($1, $2, $3, $4, $4, 'active', $5, $6, now())
        ON CONFLICT (id) DO UPDATE
          SET status = 'active', approved_ledger = EXCLUDED.approved_ledger, updated_at = now()`,
-      [id, addr(f.borrower), str(f.amount), ev.ledger]
+      [id, addr(f.borrower), str(f.amount), totalRepayment, ev.ledger, dueTime]
     )
     await client.query(
       `UPDATE members SET has_active_loan = true WHERE address = $1`,
@@ -151,11 +192,28 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const id = num(f.loan_id)
     const borrower = addr(f.borrower)
-    await client.query(
-      `UPDATE loans SET status = 'defaulted', defaulted_ledger = $2, updated_at = now() WHERE id = $1`,
+    // Guard on the loan's own status rather than trusting the poll loop
+    // never redelivers a page (it can — see the event re-delivery issue in
+    // this repo). `loans.rs::mark_loan_defaulted` only ever transitions a
+    // loan out of `Active` once, so re-running this UPDATE for an
+    // already-defaulted loan is a no-op (`rowCount === 0`), and that's the
+    // signal used below to skip re-applying the penalty and re-notifying.
+    const updated = await client.query(
+      `UPDATE loans SET status = 'defaulted', defaulted_ledger = $2, updated_at = now()
+       WHERE id = $1 AND status <> 'defaulted'`,
       [id, ev.ledger]
     )
-    await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [borrower])
+    if (updated.rowCount === 0) return
+
+    await client.query(
+      `UPDATE members
+         SET contribution    = GREATEST(contribution - $2, 0),
+             has_active_loan = false,
+             defaults_count  = defaults_count + 1,
+             updated_at      = now()
+       WHERE address = $1`,
+      [borrower, str(f.penalty)]
+    )
     await notify(
       client,
       ev,
@@ -188,8 +246,10 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const column = f.support === true ? 'votes_for' : 'votes_against'
     await client.query(
-      `UPDATE treasury_proposals SET ${column} = ${column} + 1, updated_at = now() WHERE id = $1`,
-      [num(f.id)]
+      `UPDATE treasury_proposals
+         SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
+       WHERE id = $1`,
+      [num(f.id), weightOf(f)]
     )
   },
 
@@ -240,8 +300,10 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const column = f.support === true ? 'votes_for' : 'votes_against'
     await client.query(
-      `UPDATE treasury_proposals SET ${column} = ${column} + 1, updated_at = now() WHERE id = $1`,
-      [num(f.proposal_id)]
+      `UPDATE treasury_proposals
+         SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
+       WHERE id = $1`,
+      [num(f.proposal_id), weightOf(f)]
     )
   },
 }

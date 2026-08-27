@@ -27,6 +27,7 @@ describe('indexer handlers: loans', () => {
     expect(rows[0]?.amount).toBe('1000')
     expect(rows[0]?.total_repayment).toBe('1100')
     expect(rows[0]?.votes_for).toBe('0')
+    expect(rows[0]?.voter_count).toBe(0)
   })
 
   it('loan_edit updates the amount and total_repayment on an existing proposal', async () => {
@@ -43,7 +44,7 @@ describe('indexer handlers: loans', () => {
     expect(rows[0]?.total_repayment).toBe('2200')
   })
 
-  it('loan_vote tallies for- and against-votes on the right proposal', async () => {
+  it('loan_vote tallies for- and against-votes on the right proposal, with an unweighted event counting as weight 1', async () => {
     await applyEvent(
       client,
       decodedEvent('loan_req', { id: 3, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
@@ -55,9 +56,26 @@ describe('indexer handlers: loans', () => {
     const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 3')
     expect(rows[0]?.votes_for).toBe('2')
     expect(rows[0]?.votes_against).toBe('1')
+    expect(rows[0]?.voter_count).toBe(3)
   })
 
-  it('loan_appr marks the proposal approved, opens a loan, and flags the borrower as having an active loan', async () => {
+  it('loan_vote sums stake-weighted power once the event carries a weight, matching what the contract would compute', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 30, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    // Mirrors util::voting_weight: 1 base vote + a capped stake bonus.
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 30, voter: 'GV1', support: true, weight: '1' }))
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 30, voter: 'GV2', support: true, weight: '6' }))
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 30, voter: 'GV3', support: false, weight: '3' }))
+
+    const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 30')
+    expect(rows[0]?.votes_for).toBe('7') // 1 + 6, matching a contract-side sum of the same weights
+    expect(rows[0]?.votes_against).toBe('3')
+    expect(rows[0]?.voter_count).toBe(3) // distinct voters, independent of weight
+  })
+
+  it('loan_appr marks the proposal approved, opens a loan seeded with total_repayment (not the bare principal), and flags the borrower as having an active loan', async () => {
     await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
     await applyEvent(
       client,
@@ -70,12 +88,25 @@ describe('indexer handlers: loans', () => {
 
     const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 4')
     expect(loans).toHaveLength(1)
-    expect(loans[0]?.outstanding).toBe('1000')
+    expect(loans[0]?.amount).toBe('1000')
     expect(loans[0]?.total_repayment).toBe('1100')
+    // Outstanding is what the contract would actually collect via repay_loan
+    // (total_repayment - amount_repaid, with amount_repaid still 0) — the
+    // principal alone understates it by the interest charge.
+    expect(loans[0]?.outstanding).toBe('1100')
     expect(loans[0]?.status).toBe('active')
 
     const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
     expect(members[0]?.has_active_loan).toBe(true)
+  })
+
+  it('loan_appr falls back to the principal when no matching proposal row exists', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
+    await applyEvent(client, decodedEvent('loan_appr', { id: 40, borrower: 'GBORROWER', amount: '500' }))
+
+    const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 40')
+    expect(loans[0]?.total_repayment).toBe('500')
+    expect(loans[0]?.outstanding).toBe('500')
   })
 
   it('loan_rpy with zero outstanding marks the loan repaid and clears has_active_loan', async () => {
@@ -111,8 +142,8 @@ describe('indexer handlers: loans', () => {
     expect(members[0]?.has_active_loan).toBe(true)
   })
 
-  it('loan_dflt marks the loan defaulted, clears has_active_loan, and records defaulted_ledger', async () => {
-    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
+  it('loan_dflt marks the loan defaulted, clears has_active_loan, slashes contribution by the penalty, and records defaulted_ledger', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '1000' }))
     await applyEvent(
       client,
       decodedEvent('loan_req', { id: 7, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
@@ -126,6 +157,40 @@ describe('indexer handlers: loans', () => {
 
     const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
     expect(members[0]?.has_active_loan).toBe(false)
+    expect(members[0]?.contribution).toBe('800')
+    expect(members[0]?.defaults_count).toBe(1)
+  })
+
+  it('loan_dflt never lets contribution go negative, clamping the penalty at the member\'s remaining contribution', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '50' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 70, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_appr', { id: 70, borrower: 'GBORROWER', amount: '1000' }))
+    await applyEvent(client, decodedEvent('loan_dflt', { loan_id: 70, borrower: 'GBORROWER', penalty: '9999' }))
+
+    const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
+    expect(members[0]?.contribution).toBe('0')
+  })
+
+  it('re-delivering the same loan_dflt event does not slash contribution twice', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '1000' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 71, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_appr', { id: 71, borrower: 'GBORROWER', amount: '1000' }))
+    const dfltEv = decodedEvent('loan_dflt', { loan_id: 71, borrower: 'GBORROWER', penalty: '200' })
+    await applyEvent(client, dfltEv)
+    await applyEvent(client, dfltEv) // simulated re-delivery of the same page
+
+    const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
+    expect(members[0]?.contribution).toBe('800')
+    expect(members[0]?.defaults_count).toBe(1)
+
+    const notifs = await query('SELECT * FROM notifications WHERE address = $1 AND type = $2', ['GBORROWER', 'error'])
+    expect(notifs).toHaveLength(1)
   })
 
   it('interest is a documented no-op (no per-member payload to apply)', async () => {

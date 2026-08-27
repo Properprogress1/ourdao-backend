@@ -27,6 +27,22 @@ function cursor(v: unknown): number | null {
   return Number.isFinite(n) ? n : null
 }
 
+// A loan's interest charge and repayment progress aren't stored columns —
+// both derive from total_repayment, which issue #11 added — so compute them
+// at read time rather than duplicating state that could drift out of sync.
+// BigInt (not Number) because these are NUMERIC(40,0) decimal strings that
+// can exceed Number.MAX_SAFE_INTEGER.
+function withLoanDerived(loan: LoanRow): LoanRow & { interest_charge: string; repaid_amount: string } {
+  const totalRepayment = BigInt(loan.total_repayment)
+  const amount = BigInt(loan.amount)
+  const outstanding = BigInt(loan.outstanding)
+  return {
+    ...loan,
+    interest_charge: (totalRepayment - amount).toString(),
+    repaid_amount: (totalRepayment - outstanding).toString(),
+  }
+}
+
 export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: MemoryNonceStore }): Promise<void> {
   const { nonceStore } = opts
   
@@ -85,13 +101,14 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     }
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
     params.push(l)
-    return query<LoanRow>(`SELECT * FROM loans ${where} ORDER BY id DESC LIMIT $${params.length}`, params)
+    const loans = await query<LoanRow>(`SELECT * FROM loans ${where} ORDER BY id DESC LIMIT $${params.length}`, params)
+    return loans.map(withLoanDerived)
   })
 
   app.get<{ Params: { id: string } }>('/loans/:id', async (req, reply) => {
     const loan = await queryOne<LoanRow>('SELECT * FROM loans WHERE id = $1', [Number(req.params.id)])
     if (!loan) return reply.code(404).send({ error: 'loan not found' })
-    return loan
+    return withLoanDerived(loan)
   })
 
   // --- Treasury proposals ---
@@ -218,6 +235,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       total_loan_proposals: string
       total_loans: string
       active_loans: string
+      defaulted_loans: string
+      total_defaulted_value: string | null
       total_treasury_proposals: string
       total_staked: string | null
       last_ledger: number | null
@@ -229,6 +248,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
          (SELECT count(*) FROM loan_proposals)                                     AS total_loan_proposals,
          (SELECT count(*) FROM loans)                                              AS total_loans,
          (SELECT count(*) FROM loans WHERE status = 'active')                      AS active_loans,
+         (SELECT count(*) FROM loans WHERE status = 'defaulted')                   AS defaulted_loans,
+         (SELECT COALESCE(sum(outstanding), 0) FROM loans WHERE status = 'defaulted') AS total_defaulted_value,
          (SELECT count(*) FROM treasury_proposals)                                 AS total_treasury_proposals,
          (SELECT COALESCE(sum(stake), 0) FROM members)                             AS total_staked,
          (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
@@ -247,6 +268,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       totalLoanProposals: Number(row?.total_loan_proposals ?? 0),
       totalLoans: Number(row?.total_loans ?? 0),
       activeLoans: Number(row?.active_loans ?? 0),
+      defaultedLoans: Number(row?.defaulted_loans ?? 0),
+      totalDefaultedValue: String(row?.total_defaulted_value ?? '0'),
       totalTreasuryProposals: Number(row?.total_treasury_proposals ?? 0),
       totalStaked: String(row?.total_staked ?? '0'),
       lastIndexedLedger: lastLedger,

@@ -11,25 +11,35 @@ export const EVENT_FIELDS = {
   claimed: ['member', 'pending'],
   loan_req: ['id', 'borrower', 'amount', 'total_repayment'],
   loan_edit: ['proposal_id', 'borrower', 'new_amount', 'total_repayment'],
-  loan_vote: ['proposal_id', 'voter', 'support'],
+  // `weight` is not yet published by ourdao-contracts — the contract applies
+  // stake-weighted voting power internally (util::voting_weight) but only
+  // publishes `support`. Named here ahead of time so that once the contract
+  // adds it as a 4th tuple entry, it decodes automatically with no change to
+  // this file; until then it decodes as `null` and handlers.ts treats that
+  // as a weight of 1.
+  loan_vote: ['proposal_id', 'voter', 'support', 'weight'],
   // `id` here is the disbursed loan's id, which the contract deliberately
   // reuses as the originating proposal's id (loans.rs::approve_and_disburse
   // sets `id = proposal.id` rather than drawing from a separate counter) —
   // a proposal produces at most one loan, so this is a real invariant, not
   // a coincidence. The loan_appr handler below relies on it to update both
   // loan_proposals and loans with the same `id`.
-  loan_appr: ['id', 'borrower', 'amount'],
+  // `due_time` is likewise not yet published by ourdao-contracts (the
+  // contract computes it in approve_and_disburse but doesn't publish it) —
+  // named ahead of time for the same forward-compat reason as `loan_vote`'s
+  // `weight` above.
+  loan_appr: ['id', 'borrower', 'amount', 'due_time'],
   loan_rpy: ['loan_id', 'borrower', 'outstanding'],
   loan_dflt: ['loan_id', 'borrower', 'penalty'],
   interest: ['interest', 'active'],
   tre_prop: ['id', 'amount', 'destination', 'private'],
-  tre_vote: ['id', 'voter', 'support'],
+  tre_vote: ['id', 'voter', 'support', 'weight'],
   tre_exec: ['id', 'amount', 'destination'],
   staked: ['member', 'amount', 'new_stake'],
   unstaked: ['member', 'amount', 'new_stake'],
   name_reg: ['name', 'owner'],
   committed: ['proposal_id', 'voter'],
-  revealed: ['proposal_id', 'voter', 'support'],
+  revealed: ['proposal_id', 'voter', 'support', 'weight'],
   doc_attn: ['kind', 'proposal_id', 'caller'],
   // Admin/governance events. `policy`, `paused`, and `unpaused` carry no data
   // tuple (the contract publishes `()`), so they have no named fields.

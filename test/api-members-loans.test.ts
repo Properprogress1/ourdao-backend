@@ -68,4 +68,19 @@ describe('API: members and loans', () => {
     expect(found.statusCode).toBe(200)
     expect(found.json().borrower).toBe('GA')
   })
+
+  it('GET /api/loans/:id exposes the interest charge and repayment progress derived from total_repayment', async () => {
+    await query(
+      `INSERT INTO loans (id, borrower, amount, total_repayment, outstanding, status) VALUES
+       (5, 'GA', 1000, 1080, 1080, 'active')`
+    )
+    const res = await app.inject({ method: 'GET', url: '/api/loans/5' })
+    const body = res.json()
+    expect(body.interest_charge).toBe('80')
+    expect(body.repaid_amount).toBe('0')
+
+    await query(`UPDATE loans SET outstanding = 380 WHERE id = 5`)
+    const afterPartial = (await app.inject({ method: 'GET', url: '/api/loans/5' })).json()
+    expect(afterPartial.repaid_amount).toBe('700')
+  })
 })

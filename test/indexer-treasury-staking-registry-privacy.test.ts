@@ -38,6 +38,20 @@ describe('indexer handlers: treasury', () => {
     const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 2')
     expect(rows[0]?.votes_for).toBe('1')
     expect(rows[0]?.votes_against).toBe('2')
+    expect(rows[0]?.voter_count).toBe(3)
+  })
+
+  it('tre_vote sums stake-weighted power once the event carries a weight', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('tre_prop', { id: 20, amount: '5000', destination: 'GDEST', private: false })
+    )
+    await applyEvent(client, decodedEvent('tre_vote', { id: 20, voter: 'GV1', support: true, weight: '4' }))
+    await applyEvent(client, decodedEvent('tre_vote', { id: 20, voter: 'GV2', support: true, weight: '2' }))
+
+    const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 20')
+    expect(rows[0]?.votes_for).toBe('6')
+    expect(rows[0]?.voter_count).toBe(2)
   })
 
   it('tre_exec marks the proposal executed and notifies the destination', async () => {
@@ -65,6 +79,7 @@ describe('indexer handlers: treasury', () => {
 
     const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 4')
     expect(rows[0]?.votes_for).toBe('1')
+    expect(rows[0]?.voter_count).toBe(1)
   })
 
   it('committed only notifies the voter; it does not tally a vote', async () => {

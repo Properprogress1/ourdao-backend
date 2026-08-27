@@ -52,6 +52,19 @@ describe('decodeEvent', () => {
     expect(typeof ev.fields.amount).toBe('string')
   })
 
+  it('decodes loan_vote without a weight field as a missing (null) weight, not an error', () => {
+    // The current contract publishes only (proposal_id, voter, support) —
+    // `weight` is reserved in EVENT_FIELDS for once ourdao-contracts adds it.
+    const data = tuple(
+      nativeToScVal(1, { type: 'u32' }),
+      new Address(ADDR).toScVal(),
+      nativeToScVal(true)
+    )
+    const ev = decodeEvent(makeEvent('loan_vote', data))
+    expect(ev.fields.support).toBe(true)
+    expect(ev.fields.weight).toBeNull()
+  })
+
   it('falls back to an empty fields map for an unknown symbol, but keeps the raw data', () => {
     const data = tuple(nativeToScVal(1, { type: 'u32' }))
     const ev = decodeEvent(makeEvent('totally_unknown_symbol', data))

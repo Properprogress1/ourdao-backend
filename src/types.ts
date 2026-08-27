@@ -17,6 +17,7 @@ export interface MemberRow {
   stake: string
   has_active_loan: boolean
   name: string | null
+  defaults_count: number
   updated_at: string
 }
 
@@ -26,8 +27,11 @@ export interface LoanProposalRow {
   amount: string
   total_repayment: string
   status: LoanProposalStatus
+  // Stake-weighted voting power (matches the contract's i128 for_votes /
+  // against_votes), not a headcount — see voter_count for that.
   votes_for: string
   votes_against: string
+  voter_count: number
   created_ledger: number | null
   updated_at: string
 }
@@ -54,6 +58,7 @@ export interface TreasuryProposalRow {
   status: TreasuryProposalStatus
   votes_for: string
   votes_against: string
+  voter_count: number
   created_ledger: number | null
   executed_ledger: number | null
   updated_at: string
@@ -91,6 +96,8 @@ export interface DAOStats {
   totalLoanProposals: number
   totalLoans: number
   activeLoans: number
+  defaultedLoans: number
+  totalDefaultedValue: string
   totalTreasuryProposals: number
   totalStaked: string
   lastIndexedLedger: number | null
