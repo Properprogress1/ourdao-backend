@@ -17,6 +17,7 @@ export interface MemberRow {
   stake: string
   has_active_loan: boolean
   name: string | null
+  defaults_count: number
   updated_at: string
 }
 
@@ -91,6 +92,8 @@ export interface DAOStats {
   totalLoanProposals: number
   totalLoans: number
   activeLoans: number
+  defaultedLoans: number
+  totalDefaultedValue: string
   totalTreasuryProposals: number
   totalStaked: string
   lastIndexedLedger: number | null

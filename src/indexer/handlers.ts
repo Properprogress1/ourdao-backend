@@ -176,11 +176,28 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const id = num(f.loan_id)
     const borrower = addr(f.borrower)
-    await client.query(
-      `UPDATE loans SET status = 'defaulted', defaulted_ledger = $2, updated_at = now() WHERE id = $1`,
+    // Guard on the loan's own status rather than trusting the poll loop
+    // never redelivers a page (it can — see the event re-delivery issue in
+    // this repo). `loans.rs::mark_loan_defaulted` only ever transitions a
+    // loan out of `Active` once, so re-running this UPDATE for an
+    // already-defaulted loan is a no-op (`rowCount === 0`), and that's the
+    // signal used below to skip re-applying the penalty and re-notifying.
+    const updated = await client.query(
+      `UPDATE loans SET status = 'defaulted', defaulted_ledger = $2, updated_at = now()
+       WHERE id = $1 AND status <> 'defaulted'`,
       [id, ev.ledger]
     )
-    await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [borrower])
+    if (updated.rowCount === 0) return
+
+    await client.query(
+      `UPDATE members
+         SET contribution    = GREATEST(contribution - $2, 0),
+             has_active_loan = false,
+             defaults_count  = defaults_count + 1,
+             updated_at      = now()
+       WHERE address = $1`,
+      [borrower, str(f.penalty)]
+    )
     await notify(
       client,
       ev,

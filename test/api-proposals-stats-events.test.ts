@@ -35,7 +35,7 @@ describe('API: proposals, stats, events, admin/log', () => {
     await query(`INSERT INTO loan_proposals (id, borrower, amount) VALUES (1, 'GA', 100)`)
     await query(
       `INSERT INTO loans (id, borrower, amount, outstanding, status) VALUES
-       (1, 'GA', 100, 100, 'active'), (2, 'GA', 50, 0, 'repaid')`
+       (1, 'GA', 100, 100, 'active'), (2, 'GA', 50, 0, 'repaid'), (3, 'GA', 80, 88, 'defaulted')`
     )
     await query(`INSERT INTO treasury_proposals (id, amount, destination) VALUES (1, 500, 'GD')`)
     await query(
@@ -46,8 +46,10 @@ describe('API: proposals, stats, events, admin/log', () => {
     const res = await app.inject({ method: 'GET', url: '/api/stats' })
     const body = res.json()
     expect(body.totalMembers).toBe(1) // only the non-exited one
-    expect(body.totalLoans).toBe(2)
+    expect(body.totalLoans).toBe(3)
     expect(body.activeLoans).toBe(1)
+    expect(body.defaultedLoans).toBe(1)
+    expect(body.totalDefaultedValue).toBe('88')
     expect(body.totalLoanProposals).toBe(1)
     expect(body.totalTreasuryProposals).toBe(1)
     expect(body.totalStaked).toBe('100')

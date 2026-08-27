@@ -55,8 +55,11 @@ CREATE TABLE IF NOT EXISTS members (
   stake           NUMERIC(40,0) NOT NULL DEFAULT 0,
   has_active_loan BOOLEAN NOT NULL DEFAULT false,
   name            TEXT,
+  defaults_count  INTEGER NOT NULL DEFAULT 0,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Additive columns for a database created before this column existed.
+ALTER TABLE members ADD COLUMN IF NOT EXISTS defaults_count INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS loan_proposals (
   id              INTEGER PRIMARY KEY,

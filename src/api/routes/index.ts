@@ -235,6 +235,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       total_loan_proposals: string
       total_loans: string
       active_loans: string
+      defaulted_loans: string
+      total_defaulted_value: string | null
       total_treasury_proposals: string
       total_staked: string | null
       last_ledger: number | null
@@ -246,6 +248,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
          (SELECT count(*) FROM loan_proposals)                                     AS total_loan_proposals,
          (SELECT count(*) FROM loans)                                              AS total_loans,
          (SELECT count(*) FROM loans WHERE status = 'active')                      AS active_loans,
+         (SELECT count(*) FROM loans WHERE status = 'defaulted')                   AS defaulted_loans,
+         (SELECT COALESCE(sum(outstanding), 0) FROM loans WHERE status = 'defaulted') AS total_defaulted_value,
          (SELECT count(*) FROM treasury_proposals)                                 AS total_treasury_proposals,
          (SELECT COALESCE(sum(stake), 0) FROM members)                             AS total_staked,
          (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
@@ -264,6 +268,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       totalLoanProposals: Number(row?.total_loan_proposals ?? 0),
       totalLoans: Number(row?.total_loans ?? 0),
       activeLoans: Number(row?.active_loans ?? 0),
+      defaultedLoans: Number(row?.defaulted_loans ?? 0),
+      totalDefaultedValue: String(row?.total_defaulted_value ?? '0'),
       totalTreasuryProposals: Number(row?.total_treasury_proposals ?? 0),
       totalStaked: String(row?.total_staked ?? '0'),
       lastIndexedLedger: lastLedger,

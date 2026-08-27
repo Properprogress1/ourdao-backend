@@ -124,8 +124,8 @@ describe('indexer handlers: loans', () => {
     expect(members[0]?.has_active_loan).toBe(true)
   })
 
-  it('loan_dflt marks the loan defaulted, clears has_active_loan, and records defaulted_ledger', async () => {
-    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
+  it('loan_dflt marks the loan defaulted, clears has_active_loan, slashes contribution by the penalty, and records defaulted_ledger', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '1000' }))
     await applyEvent(
       client,
       decodedEvent('loan_req', { id: 7, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
@@ -139,6 +139,40 @@ describe('indexer handlers: loans', () => {
 
     const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
     expect(members[0]?.has_active_loan).toBe(false)
+    expect(members[0]?.contribution).toBe('800')
+    expect(members[0]?.defaults_count).toBe(1)
+  })
+
+  it('loan_dflt never lets contribution go negative, clamping the penalty at the member\'s remaining contribution', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '50' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 70, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_appr', { id: 70, borrower: 'GBORROWER', amount: '1000' }))
+    await applyEvent(client, decodedEvent('loan_dflt', { loan_id: 70, borrower: 'GBORROWER', penalty: '9999' }))
+
+    const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
+    expect(members[0]?.contribution).toBe('0')
+  })
+
+  it('re-delivering the same loan_dflt event does not slash contribution twice', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '1000' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 71, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_appr', { id: 71, borrower: 'GBORROWER', amount: '1000' }))
+    const dfltEv = decodedEvent('loan_dflt', { loan_id: 71, borrower: 'GBORROWER', penalty: '200' })
+    await applyEvent(client, dfltEv)
+    await applyEvent(client, dfltEv) // simulated re-delivery of the same page
+
+    const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
+    expect(members[0]?.contribution).toBe('800')
+    expect(members[0]?.defaults_count).toBe(1)
+
+    const notifs = await query('SELECT * FROM notifications WHERE address = $1 AND type = $2', ['GBORROWER', 'error'])
+    expect(notifs).toHaveLength(1)
   })
 
   it('interest is a documented no-op (no per-member payload to apply)', async () => {
