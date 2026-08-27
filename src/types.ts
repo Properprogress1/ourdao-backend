@@ -27,8 +27,11 @@ export interface LoanProposalRow {
   amount: string
   total_repayment: string
   status: LoanProposalStatus
+  // Stake-weighted voting power (matches the contract's i128 for_votes /
+  // against_votes), not a headcount — see voter_count for that.
   votes_for: string
   votes_against: string
+  voter_count: number
   created_ledger: number | null
   updated_at: string
 }
@@ -55,6 +58,7 @@ export interface TreasuryProposalRow {
   status: TreasuryProposalStatus
   votes_for: string
   votes_against: string
+  voter_count: number
   created_ledger: number | null
   executed_ledger: number | null
   updated_at: string

@@ -29,6 +29,20 @@ async function notify(
 
 // Per-event handlers -------------------------------------------------------
 // Each mutates derived tables for one decoded event. `f` is ev.fields.
+//
+// Rule of thumb (see issue #10): a handler must mirror the contract's own
+// state transition for the field it's writing — assign where the contract
+// assigns a fresh value onto the record, accumulate only where the contract
+// itself accumulates. `joined` is the clearest example: register_member
+// builds an entirely new `Member` record on every call, including a rejoin,
+// so the indexer must overwrite rather than add. `claimed`'s `pending_claimed`
+// is different on purpose — it's an indexer-only lifetime counter with no
+// on-chain equivalent to mirror, so accumulating there is correct.
+
+// Contract-published voting weight, once ourdao-contracts adds it to the vote
+// events (see the linked issue there). Until then the field decodes as
+// null/undefined and every vote counts as weight 1, same as before.
+const weightOf = (f: Record<string, unknown>): string => (f.weight == null ? '1' : str(f.weight))
 
 type Handler = (client: PoolClient, ev: DecodedEvent) => Promise<void>
 
@@ -109,8 +123,10 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const column = f.support === true ? 'votes_for' : 'votes_against'
     await client.query(
-      `UPDATE loan_proposals SET ${column} = ${column} + 1, updated_at = now() WHERE id = $1`,
-      [num(f.proposal_id)]
+      `UPDATE loan_proposals
+         SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
+       WHERE id = $1`,
+      [num(f.proposal_id), weightOf(f)]
     )
   },
 
@@ -230,8 +246,10 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const column = f.support === true ? 'votes_for' : 'votes_against'
     await client.query(
-      `UPDATE treasury_proposals SET ${column} = ${column} + 1, updated_at = now() WHERE id = $1`,
-      [num(f.id)]
+      `UPDATE treasury_proposals
+         SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
+       WHERE id = $1`,
+      [num(f.id), weightOf(f)]
     )
   },
 
@@ -282,8 +300,10 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const column = f.support === true ? 'votes_for' : 'votes_against'
     await client.query(
-      `UPDATE treasury_proposals SET ${column} = ${column} + 1, updated_at = now() WHERE id = $1`,
-      [num(f.proposal_id)]
+      `UPDATE treasury_proposals
+         SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
+       WHERE id = $1`,
+      [num(f.proposal_id), weightOf(f)]
     )
   },
 }

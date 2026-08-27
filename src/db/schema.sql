@@ -58,9 +58,11 @@ CREATE TABLE IF NOT EXISTS members (
   defaults_count  INTEGER NOT NULL DEFAULT 0,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
--- Additive columns for a database created before this column existed.
-ALTER TABLE members ADD COLUMN IF NOT EXISTS defaults_count INTEGER NOT NULL DEFAULT 0;
 
+-- `votes_for`/`votes_against` hold stake-weighted voting power (see the
+-- Event catalog section of the README), which can exceed what INTEGER was
+-- originally sized for once every voter's weight is summed — matched to the
+-- contract's own i128 `for_votes`/`against_votes` fields.
 CREATE TABLE IF NOT EXISTS loan_proposals (
   id              INTEGER PRIMARY KEY,
   borrower        TEXT NOT NULL,
@@ -69,6 +71,7 @@ CREATE TABLE IF NOT EXISTS loan_proposals (
   status          TEXT NOT NULL DEFAULT 'pending',
   votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
   votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
+  voter_count     INTEGER NOT NULL DEFAULT 0,
   created_ledger  BIGINT,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -102,6 +105,7 @@ CREATE TABLE IF NOT EXISTS treasury_proposals (
   status          TEXT NOT NULL DEFAULT 'pending',
   votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
   votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
+  voter_count     INTEGER NOT NULL DEFAULT 0,
   created_ledger  BIGINT,
   executed_ledger BIGINT,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()

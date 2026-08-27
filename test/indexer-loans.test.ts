@@ -27,6 +27,7 @@ describe('indexer handlers: loans', () => {
     expect(rows[0]?.amount).toBe('1000')
     expect(rows[0]?.total_repayment).toBe('1100')
     expect(rows[0]?.votes_for).toBe('0')
+    expect(rows[0]?.voter_count).toBe(0)
   })
 
   it('loan_edit updates the amount and total_repayment on an existing proposal', async () => {
@@ -43,7 +44,7 @@ describe('indexer handlers: loans', () => {
     expect(rows[0]?.total_repayment).toBe('2200')
   })
 
-  it('loan_vote tallies for- and against-votes on the right proposal', async () => {
+  it('loan_vote tallies for- and against-votes on the right proposal, with an unweighted event counting as weight 1', async () => {
     await applyEvent(
       client,
       decodedEvent('loan_req', { id: 3, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
@@ -55,9 +56,26 @@ describe('indexer handlers: loans', () => {
     const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 3')
     expect(rows[0]?.votes_for).toBe('2')
     expect(rows[0]?.votes_against).toBe('1')
+    expect(rows[0]?.voter_count).toBe(3)
   })
 
-  it('loan_appr marks the proposal approved, opens a loan, and flags the borrower as having an active loan', async () => {
+  it('loan_vote sums stake-weighted power once the event carries a weight, matching what the contract would compute', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 30, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    // Mirrors util::voting_weight: 1 base vote + a capped stake bonus.
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 30, voter: 'GV1', support: true, weight: '1' }))
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 30, voter: 'GV2', support: true, weight: '6' }))
+    await applyEvent(client, decodedEvent('loan_vote', { proposal_id: 30, voter: 'GV3', support: false, weight: '3' }))
+
+    const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 30')
+    expect(rows[0]?.votes_for).toBe('7') // 1 + 6, matching a contract-side sum of the same weights
+    expect(rows[0]?.votes_against).toBe('3')
+    expect(rows[0]?.voter_count).toBe(3) // distinct voters, independent of weight
+  })
+
+  it('loan_appr marks the proposal approved, opens a loan seeded with total_repayment (not the bare principal), and flags the borrower as having an active loan', async () => {
     await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
     await applyEvent(
       client,
