@@ -112,13 +112,17 @@ To add a schema change: update `schema.sql` to the new desired shape (for fresh 
 | `schema_migrations` | Tracks which numbered migrations have been applied | `version`, `name`, `applied_at` |
 | `indexer_cursor` | Single-row resume state for the poll loop | `paging_token`, `last_ledger`, `contract_id` (cursor is discarded on a cold start if it belongs to a different contract) |
 | `events` | Append-only raw event log — the source everything else is derived from | `symbol`, `topics` (JSONB), `data` (JSONB), `tx_hash` |
-| `members` | Current membership state | `contribution`, `stake`, `has_active_loan`, `pending_claimed`, `name` (from the registry) |
-| `loan_proposals` | Loan votes in flight | `status` (`pending`/`approved`/`rejected`), `votes_for`, `votes_against` |
-| `loans` | Disbursed loans | `status` (`active`/`repaid`/`defaulted`), `outstanding`, `total_repayment` (carried over from the originating proposal), `due_time`. **`id` doubles as the originating `loan_proposals.id`** — the contract reuses the proposal's own id for the disbursed loan rather than a separate counter, since a proposal produces at most one loan. |
-| `treasury_proposals` | Treasury withdrawal votes | `private` (routed through commit-reveal instead of open voting), `status` |
+| `members` | Current membership state | `contribution`, `stake`, `has_active_loan`, `pending_claimed`, `name` (from the registry), `defaults_count` |
+| `loan_proposals` | Loan votes in flight | `status` (`pending`/`approved`/`rejected`), `votes_for`, `votes_against`, `voter_count` |
+| `loans` | Disbursed loans | `status` (`active`/`repaid`/`defaulted`), `total_repayment`, `outstanding`, `due_time`. **`id` doubles as the originating `loan_proposals.id`** — the contract reuses the proposal's own id for the disbursed loan rather than a separate counter, since a proposal produces at most one loan. |
+| `treasury_proposals` | Treasury withdrawal votes | `private` (routed through commit-reveal instead of open voting), `status`, `votes_for`, `votes_against`, `voter_count` |
 | `notifications` | Per-address notification feed | `type`, `read`, indexed on `(address, read)` |
 
 On-chain `i128` amounts are stored as `NUMERIC(40,0)` (an i128's max value is ~1.7×10³⁸, which fits under 10³⁹) and returned from the API as **decimal strings**, never JSON numbers, to avoid silent precision loss — this was in fact a real bug found and fixed during development: `pg` returns Postgres `BIGINT` columns as JS strings by default, and the original code assumed they came back as numbers.
+
+**Vote tallies are stake-weighted, not a headcount.** The contract grants each voter `1 + min(stake / STAKE_WEIGHT_UNIT, MAX_STAKE_BONUS)` voting power (currently up to 6) and sums that into `for_votes`/`against_votes`. `votes_for`/`votes_against` mirror that (hence `NUMERIC(40,0)`, matching the contract's own field width, not a plain vote count); `voter_count` is the distinct-voter headcount alongside it, so a client can show both "7 members voted" and "carrying 19 voting power." **The contract doesn't publish the weight it applied yet** — `loan_vote`/`tre_vote`/`revealed` currently carry only `support` — so today every vote folds in as weight 1 regardless of stake, and `votes_for`/`votes_against` under-count for any staked voter until [the upstream fix](https://github.com/ourdao/ourdao-contracts) lands. The decoder and handlers already read a `weight` field the moment the contract adds one, with no further backend change needed.
+
+**A loan's `outstanding` balance starts at `total_repayment`, not the principal.** The contract collects `total_repayment = amount + interest` on `repay_loan`, so a loan is never worth just its principal from a borrower's perspective. `loan_appr` doesn't publish `total_repayment` (only the disbursed `amount`), so the indexer sources it from the just-approved `loan_proposals` row instead — `loans.id == loan_proposals.id` is a documented contract invariant, and that row already carries `total_repayment` from `loan_req`/`loan_edit`. This depends on that proposal row existing, which it will unless the indexer started mid-history; if it's missing, `total_repayment` falls back to the principal. `due_time` has the same gap — the contract computes it but doesn't publish it on `loan_appr` — so it's `NULL` until that's fixed upstream. `GET /api/loans` and `/api/loans/:id` also expose `interest_charge` and `repaid_amount`, both derived from `total_repayment` at read time.
 
 ## Event catalog
 
@@ -131,18 +135,18 @@ The full topic-symbol → data-tuple mapping this service decodes (kept in sync 
 | `claimed` | `member, pending` | tracks claimed yield |
 | `loan_req` | `id, borrower, amount, total_repayment` | inserts a pending `loan_proposals` row |
 | `loan_edit` | `proposal_id, borrower, new_amount, total_repayment` | updates the proposal |
-| `loan_vote` | `proposal_id, voter, support` | increments the vote tally |
-| `loan_appr` | `id, borrower, amount` | marks the proposal approved, opens a `loans` row, flags the borrower's `has_active_loan` |
+| `loan_vote` | `proposal_id, voter, support`, plus a reserved `weight` not yet published (see above) | adds the vote's weight to the tally, bumps `voter_count` |
+| `loan_appr` | `id, borrower, amount`, plus a reserved `due_time` not yet published | marks the proposal approved, opens a `loans` row seeded with `total_repayment` from the matching proposal (not the bare principal — see below), flags the borrower's `has_active_loan` |
 | `loan_rpy` | `loan_id, borrower, outstanding` | updates outstanding balance; marks `repaid` when it hits zero |
-| `loan_dflt` | `loan_id, borrower, penalty` | marks the loan `defaulted`, clears the borrower's `has_active_loan` |
+| `loan_dflt` | `loan_id, borrower, penalty` | marks the loan `defaulted`, slashes the borrower's `contribution` by the penalty (clamped at zero), bumps `defaults_count`, clears `has_active_loan` — idempotent, so redelivering the same event is a no-op past the first application |
 | `interest` | `interest, active` | no per-member payload — retained in the raw event log only |
 | `tre_prop` | `id, amount, destination, private` | inserts a pending `treasury_proposals` row |
-| `tre_vote` | `id, voter, support` | increments the vote tally |
+| `tre_vote` | `id, voter, support`, plus a reserved `weight` not yet published | adds the vote's weight to the tally, bumps `voter_count` |
 | `tre_exec` | `id, amount, destination` | marks the proposal executed, notifies the recipient |
 | `staked` / `unstaked` | `member, amount, new_stake` | updates the member's stake |
 | `name_reg` | `name, owner` | updates the member's registered name |
 | `committed` | `proposal_id, voter` | notifies the voter their commit was recorded |
-| `revealed` | `proposal_id, voter, support` | tallies the same as an open vote |
+| `revealed` | `proposal_id, voter, support`, plus a reserved `weight` not yet published | tallies the same as an open vote |
 | `doc_attn` | `kind, proposal_id, caller` | (raw log only — the content hash itself is read live from the contract, not indexed) |
 | `init`, `admin_add`, `admin_rem`, `threshold`, `policy`, `paused`, `unpaused` | varies | admin/governance events — surfaced via `/api/admin/log`, not folded into a derived table |
 
@@ -154,13 +158,13 @@ Base path: `/api`.
 |---|---|
 | `GET /health` | Liveness check + the currently configured contract id. No DB round trip. |
 | `GET /ready` | Readiness probe — checks Postgres reachability and indexer freshness. Returns `503` with a `reason` when Postgres is down or the indexer cursor is stale. |
-| `GET /api/stats` | Aggregate counts (members, loans, proposals) + the last indexed ledger. |
+| `GET /api/stats` | Aggregate counts (members, loans, proposals) + defaulted-loan count/value + the last indexed ledger. |
 | `GET /api/members` | Active members. |
 | `GET /api/members/:address` | Single member. |
-| `GET /api/proposals/loan` | Loan proposals with vote tallies. |
-| `GET /api/loans` | Loans. Optional `?borrower=`, `?before=<id>` for pagination. `status` is `active`, `repaid`, or `defaulted` — a loan is marked defaulted once it's past due plus the policy's grace period (permissionless on-chain, see `ourdao-contracts`). |
-| `GET /api/loans/:id` | Single loan. |
-| `GET /api/proposals/treasury` | Treasury proposals with vote tallies. |
+| `GET /api/proposals/loan` | Loan proposals with stake-weighted vote tallies (`votes_for`/`votes_against`) and a distinct `voter_count`. |
+| `GET /api/loans` | Loans. Optional `?borrower=`, `?before=<id>` for pagination. `status` is `active`, `repaid`, or `defaulted` — a loan is marked defaulted once it's past due plus the policy's grace period (permissionless on-chain, see `ourdao-contracts`). Each loan includes derived `interest_charge` and `repaid_amount` fields. |
+| `GET /api/loans/:id` | Single loan, with the same derived `interest_charge`/`repaid_amount` fields. |
+| `GET /api/proposals/treasury` | Treasury proposals with stake-weighted vote tallies and a distinct `voter_count`. |
 | `GET /api/notifications?address=` | Notifications for an address. |
 | `PATCH /api/notifications/:id/read` | Mark one notification read. |
 | `PATCH /api/notifications/read-all?address=` | Mark every unread notification for an address read. |
