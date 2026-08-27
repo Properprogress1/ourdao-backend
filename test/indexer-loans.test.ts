@@ -70,12 +70,25 @@ describe('indexer handlers: loans', () => {
 
     const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 4')
     expect(loans).toHaveLength(1)
-    expect(loans[0]?.outstanding).toBe('1000')
+    expect(loans[0]?.amount).toBe('1000')
     expect(loans[0]?.total_repayment).toBe('1100')
+    // Outstanding is what the contract would actually collect via repay_loan
+    // (total_repayment - amount_repaid, with amount_repaid still 0) — the
+    // principal alone understates it by the interest charge.
+    expect(loans[0]?.outstanding).toBe('1100')
     expect(loans[0]?.status).toBe('active')
 
     const members = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GBORROWER'])
     expect(members[0]?.has_active_loan).toBe(true)
+  })
+
+  it('loan_appr falls back to the principal when no matching proposal row exists', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
+    await applyEvent(client, decodedEvent('loan_appr', { id: 40, borrower: 'GBORROWER', amount: '500' }))
+
+    const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 40')
+    expect(loans[0]?.total_repayment).toBe('500')
+    expect(loans[0]?.outstanding).toBe('500')
   })
 
   it('loan_rpy with zero outstanding marks the loan repaid and clears has_active_loan', async () => {

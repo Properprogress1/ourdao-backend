@@ -121,12 +121,29 @@ const handlers: Record<string, Handler> = {
       `UPDATE loan_proposals SET status = 'approved', updated_at = now() WHERE id = $1`,
       [id]
     )
+    // `loan_appr` only carries the disbursed principal, not the repayment
+    // total — outstanding debt from day one is total_repayment (principal +
+    // interest), not the principal alone (issue #11). ourdao-contracts
+    // doesn't publish total_repayment on this event, but `loan.id ==
+    // proposal.id` is a documented invariant, so the just-approved proposal
+    // row (already carrying total_repayment from `loan_req`/`loan_edit`) is
+    // a reliable interim source. This depends on that proposal row existing,
+    // which it will unless the indexer started mid-history.
+    const proposal = await client.query<{ total_repayment: string }>(
+      `SELECT total_repayment FROM loan_proposals WHERE id = $1`,
+      [id]
+    )
+    const totalRepayment = proposal.rows[0]?.total_repayment ?? str(f.amount)
+    // due_time is a unix-seconds timestamp on the contract side; convert for
+    // the TIMESTAMPTZ column. Always null today since the event doesn't
+    // carry it yet (see the comment on EVENT_FIELDS.loan_appr).
+    const dueTime = f.due_time == null ? null : new Date(Number(f.due_time) * 1000)
     await client.query(
-      `INSERT INTO loans (id, borrower, amount, outstanding, total_repayment, status, approved_ledger, updated_at)
-       VALUES ($1, $2, $3, $3, COALESCE((SELECT total_repayment FROM loan_proposals WHERE id = $1), 0), 'active', $4, now())
+      `INSERT INTO loans (id, borrower, amount, total_repayment, outstanding, status, approved_ledger, due_time, updated_at)
+       VALUES ($1, $2, $3, $4, $4, 'active', $5, $6, now())
        ON CONFLICT (id) DO UPDATE
          SET status = 'active', approved_ledger = EXCLUDED.approved_ledger, updated_at = now()`,
-      [id, addr(f.borrower), str(f.amount), ev.ledger]
+      [id, addr(f.borrower), str(f.amount), totalRepayment, ev.ledger, dueTime]
     )
     await client.query(
       `UPDATE members SET has_active_loan = true WHERE address = $1`,

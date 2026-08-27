@@ -18,7 +18,11 @@ export const EVENT_FIELDS = {
   // a proposal produces at most one loan, so this is a real invariant, not
   // a coincidence. The loan_appr handler below relies on it to update both
   // loan_proposals and loans with the same `id`.
-  loan_appr: ['id', 'borrower', 'amount'],
+  // `due_time` is likewise not yet published by ourdao-contracts (the
+  // contract computes it in approve_and_disburse but doesn't publish it) —
+  // named ahead of time for the same forward-compat reason as `loan_vote`'s
+  // `weight` above.
+  loan_appr: ['id', 'borrower', 'amount', 'due_time'],
   loan_rpy: ['loan_id', 'borrower', 'outstanding'],
   loan_dflt: ['loan_id', 'borrower', 'penalty'],
   interest: ['interest', 'active'],

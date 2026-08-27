@@ -27,6 +27,22 @@ function cursor(v: unknown): number | null {
   return Number.isFinite(n) ? n : null
 }
 
+// A loan's interest charge and repayment progress aren't stored columns —
+// both derive from total_repayment, which issue #11 added — so compute them
+// at read time rather than duplicating state that could drift out of sync.
+// BigInt (not Number) because these are NUMERIC(40,0) decimal strings that
+// can exceed Number.MAX_SAFE_INTEGER.
+function withLoanDerived(loan: LoanRow): LoanRow & { interest_charge: string; repaid_amount: string } {
+  const totalRepayment = BigInt(loan.total_repayment)
+  const amount = BigInt(loan.amount)
+  const outstanding = BigInt(loan.outstanding)
+  return {
+    ...loan,
+    interest_charge: (totalRepayment - amount).toString(),
+    repaid_amount: (totalRepayment - outstanding).toString(),
+  }
+}
+
 export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: MemoryNonceStore }): Promise<void> {
   const { nonceStore } = opts
   
@@ -85,13 +101,14 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     }
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
     params.push(l)
-    return query<LoanRow>(`SELECT * FROM loans ${where} ORDER BY id DESC LIMIT $${params.length}`, params)
+    const loans = await query<LoanRow>(`SELECT * FROM loans ${where} ORDER BY id DESC LIMIT $${params.length}`, params)
+    return loans.map(withLoanDerived)
   })
 
   app.get<{ Params: { id: string } }>('/loans/:id', async (req, reply) => {
     const loan = await queryOne<LoanRow>('SELECT * FROM loans WHERE id = $1', [Number(req.params.id)])
     if (!loan) return reply.code(404).send({ error: 'loan not found' })
-    return loan
+    return withLoanDerived(loan)
   })
 
   // --- Treasury proposals ---
