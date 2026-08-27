@@ -162,13 +162,23 @@ const handlers: Record<string, Handler> = {
     // the TIMESTAMPTZ column. Always null today since the event doesn't
     // carry it yet (see the comment on EVENT_FIELDS.loan_appr).
     const dueTime = f.due_time == null ? null : new Date(Number(f.due_time) * 1000)
-    await client.query(
+    const loanIns = await client.query<{ is_new: boolean }>(
       `INSERT INTO loans (id, borrower, amount, total_repayment, outstanding, status, approved_ledger, due_time, updated_at)
        VALUES ($1, $2, $3, $4, $4, 'active', $5, $6, now())
        ON CONFLICT (id) DO UPDATE
-         SET status = 'active', approved_ledger = EXCLUDED.approved_ledger, updated_at = now()`,
+         SET status = 'active', approved_ledger = EXCLUDED.approved_ledger, updated_at = now()
+       RETURNING (xmax = 0) AS is_new`,
       [id, addr(f.borrower), str(f.amount), totalRepayment, ev.ledger, dueTime]
     )
+    // Fold principal lent once per loan (issue #24). `xmax = 0` is true only
+    // when this was a fresh INSERT, not the ON CONFLICT UPDATE branch — so a
+    // re-delivered `loan_appr` doesn't double-count.
+    if (loanIns.rows[0]?.is_new) {
+      await client.query(
+        `UPDATE dao_totals SET principal_lent = principal_lent + $1, updated_at = now() WHERE id = 1`,
+        [str(f.amount)]
+      )
+    }
     await client.query(
       `UPDATE members SET has_active_loan = true WHERE address = $1`,
       [addr(f.borrower)]
@@ -180,14 +190,27 @@ const handlers: Record<string, Handler> = {
     const f = ev.fields
     const outstanding = str(f.outstanding)
     const status = outstanding === '0' ? 'repaid' : 'active'
-    await client.query(
-      `UPDATE loans
+    // `FROM loans AS prev` captures the pre-update row so we can tell whether
+    // this repayment is the one that clears the loan (issue #24: fold the
+    // principal into `principal_repaid` exactly once — a re-delivered final
+    // `loan_rpy` finds `prev.status = 'repaid'` and is skipped).
+    const upd = await client.query<{ amount: string; was_repaid: boolean }>(
+      `UPDATE loans AS l
          SET outstanding = $2, status = $3,
-             repaid_ledger = CASE WHEN $3 = 'repaid' THEN $4 ELSE repaid_ledger END,
+             repaid_ledger = CASE WHEN $3 = 'repaid' THEN $4 ELSE l.repaid_ledger END,
              updated_at = now()
-       WHERE id = $1`,
+       FROM loans AS prev
+       WHERE l.id = $1 AND prev.id = $1
+       RETURNING l.amount::text AS amount, (prev.status = 'repaid') AS was_repaid`,
       [num(f.loan_id), outstanding, status, ev.ledger]
     )
+    const loan = upd.rows[0]
+    if (status === 'repaid' && loan && !loan.was_repaid) {
+      await client.query(
+        `UPDATE dao_totals SET principal_repaid = principal_repaid + $1, updated_at = now() WHERE id = 1`,
+        [loan.amount]
+      )
+    }
     if (status === 'repaid') {
       await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [addr(f.borrower)])
     }
@@ -206,12 +229,21 @@ const handlers: Record<string, Handler> = {
     // loan out of `Active` once, so re-running this UPDATE for an
     // already-defaulted loan is a no-op (`rowCount === 0`), and that's the
     // signal used below to skip re-applying the penalty and re-notifying.
-    const updated = await client.query(
+    const updated = await client.query<{ outstanding: string }>(
       `UPDATE loans SET status = 'defaulted', defaulted_ledger = $2, updated_at = now()
-       WHERE id = $1 AND status <> 'defaulted'`,
+       WHERE id = $1 AND status <> 'defaulted'
+       RETURNING outstanding::text AS outstanding`,
       [id, ev.ledger]
     )
     if (updated.rowCount === 0) return
+
+    // The status guard above already makes this fold idempotent (issue #24):
+    // value defaulted is the loan's outstanding balance at the moment it
+    // defaulted.
+    await client.query(
+      `UPDATE dao_totals SET value_defaulted = value_defaulted + $1, updated_at = now() WHERE id = 1`,
+      [updated.rows[0]?.outstanding ?? '0']
+    )
 
     await client.query(
       `UPDATE members
@@ -232,10 +264,36 @@ const handlers: Record<string, Handler> = {
     )
   },
 
-  async interest() {
-    // Interest distribution is a treasury-wide event with no per-member payload;
-    // it is retained in the raw `events` table. Per-member yield is surfaced via
-    // the `claimed` event when members claim.
+  async interest(client, ev) {
+    // Interest distribution carries no per-member breakdown, so there is still
+    // nothing to attribute (per-member yield is surfaced via `claimed`). But
+    // the aggregate it *does* carry is the DAO's revenue line — fold it into
+    // the distribution history and the lifetime total (issue #24).
+    //
+    // `f.interest` is interest *collected*: distribute_interest divides it by
+    // active members and the indivisible remainder stays in the treasury, so
+    // this is slightly more than what members were credited. `f.active` is the
+    // active-member count at this distribution, kept so per-member share is
+    // derivable historically.
+    //
+    // Idempotent on the raw event id: a re-delivered `interest` event does not
+    // double-count (ON CONFLICT DO NOTHING + the rowCount guard).
+    const f = ev.fields
+    const amount = str(f.interest)
+    const inserted = await client.query(
+      `INSERT INTO interest_distributions (event_id, ledger, amount, active_members, tx_hash)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (event_id) DO NOTHING`,
+      [ev.id, ev.ledger, amount, num(f.active), ev.txHash]
+    )
+    if (inserted.rowCount === 1) {
+      await client.query(
+        `UPDATE dao_totals
+            SET interest_collected = interest_collected + $1, updated_at = now()
+          WHERE id = 1`,
+        [amount]
+      )
+    }
   },
 
   async tre_prop(client, ev) {

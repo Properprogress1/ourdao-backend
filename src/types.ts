@@ -90,6 +90,15 @@ export interface EventRow {
   created_at: string
 }
 
+export interface InterestDistributionRow {
+  id: number
+  ledger: number
+  amount: string
+  active_members: number | null
+  tx_hash: string | null
+  created_at: string
+}
+
 export interface DAOStats {
   totalMembers: number
   activeMembers: number
@@ -100,6 +109,14 @@ export interface DAOStats {
   totalDefaultedValue: string
   totalTreasuryProposals: number
   totalStaked: string
+  // Lifetime money figures (issue #24), as decimal strings like every other
+  // on-chain amount. `interestCollected` is interest the treasury took in;
+  // the amount actually credited to members is slightly less because the
+  // contract keeps the indivisible division remainder.
+  interestCollected: string
+  principalLent: string
+  principalRepaid: string
+  valueDefaulted: string
   lastIndexedLedger: number | null
   secondsSinceUpdate: number | null
   indexerStale: boolean

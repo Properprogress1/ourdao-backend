@@ -101,6 +101,17 @@ function safeNative(scv: xdr.ScVal): unknown {
   }
 }
 
+/** Map a positional data tuple to the named fields for its symbol, using the
+ *  `EVENT_FIELDS` catalog. Unknown symbols get `{}`. Shared by the live
+ *  decoder and the re-index path (issue #23), which rebuilds `fields` from a
+ *  stored `data` tuple. */
+export function namedFields(symbol: string, data: unknown[]): Record<string, unknown> {
+  const names = EVENT_FIELDS[symbol as EventSymbol] as readonly string[] | undefined
+  const fields: Record<string, unknown> = {}
+  if (names) names.forEach((name, i) => (fields[name] = data[i] ?? null))
+  return fields
+}
+
 /** Decode one getEvents response entry into a JSON-safe DecodedEvent. */
 export function decodeEvent(ev: rpc.Api.EventResponse): DecodedEvent {
   const topics = (ev.topic ?? []).map(safeNative)
@@ -109,9 +120,7 @@ export function decodeEvent(ev: rpc.Api.EventResponse): DecodedEvent {
   const nativeValue = safeNative(ev.value)
   const data = Array.isArray(nativeValue) ? nativeValue : [nativeValue]
 
-  const names = EVENT_FIELDS[symbol as EventSymbol] as readonly string[] | undefined
-  const fields: Record<string, unknown> = {}
-  if (names) names.forEach((name, i) => (fields[name] = data[i] ?? null))
+  const fields = namedFields(symbol, data)
 
   return {
     id: ev.id,

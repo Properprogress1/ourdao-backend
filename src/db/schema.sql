@@ -20,12 +20,17 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 -- Indexer resume state (single row, id = 1).
+-- `last_ledger_hash` is the ledger-hash of the RPC's reported tip at the time
+-- the cursor was last advanced (Soroban getEvents exposes no per-event hash);
+-- it is forensic context for a detected discontinuity, not a verified
+-- processed-ledger hash. See issue #23 / README "Reorg detection".
 CREATE TABLE IF NOT EXISTS indexer_cursor (
-  id           SMALLINT PRIMARY KEY DEFAULT 1,
-  paging_token TEXT,
-  last_ledger  BIGINT,
-  contract_id  TEXT,
-  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  id               SMALLINT PRIMARY KEY DEFAULT 1,
+  paging_token     TEXT,
+  last_ledger      BIGINT,
+  last_ledger_hash TEXT,
+  contract_id      TEXT,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT indexer_cursor_singleton CHECK (id = 1)
 );
 
@@ -62,6 +67,10 @@ CREATE TABLE IF NOT EXISTS members (
   defaults_count  INTEGER NOT NULL DEFAULT 0,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Partial index for the /api/stats active-member count (issue #18): only
+-- non-exited rows, so `count(*) ... WHERE exited = false` is an index-only
+-- scan over the small live set rather than a seq scan of every member ever.
+CREATE INDEX IF NOT EXISTS members_active_idx ON members (address) WHERE exited = false;
 
 -- `votes_for`/`votes_against` hold stake-weighted voting power (see the
 -- Event catalog section of the README), which can exceed what INTEGER was
@@ -127,3 +136,33 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS notifications_address_idx ON notifications (address, read);
+
+-- Lifetime money aggregates folded from the raw event log (issue #24).
+-- Single row (id = 1). O(1) to read; kept in sync as events fold, and
+-- rebuilt exactly by `npm run reindex`. `interest_collected` is interest the
+-- treasury took in; the contract keeps the indivisible per-member division
+-- remainder, so it slightly exceeds what members were actually credited.
+CREATE TABLE IF NOT EXISTS dao_totals (
+  id                 SMALLINT PRIMARY KEY DEFAULT 1,
+  interest_collected NUMERIC(40,0) NOT NULL DEFAULT 0,
+  principal_lent     NUMERIC(40,0) NOT NULL DEFAULT 0,
+  principal_repaid   NUMERIC(40,0) NOT NULL DEFAULT 0,
+  value_defaulted    NUMERIC(40,0) NOT NULL DEFAULT 0,
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT dao_totals_singleton CHECK (id = 1)
+);
+INSERT INTO dao_totals (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- One row per `interest` event: the distribution history (issue #24).
+-- `event_id` is the raw events.id and is UNIQUE so a re-delivered event
+-- folds exactly once.
+CREATE TABLE IF NOT EXISTS interest_distributions (
+  id             BIGSERIAL PRIMARY KEY,
+  event_id       TEXT NOT NULL UNIQUE,
+  ledger         BIGINT NOT NULL,
+  amount         NUMERIC(40,0) NOT NULL,
+  active_members INTEGER,
+  tx_hash        TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS interest_distributions_ledger_idx ON interest_distributions (ledger);

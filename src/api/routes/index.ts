@@ -10,6 +10,7 @@ import type {
   NotificationRow,
   TreasuryProposalRow,
   EventRow,
+  InterestDistributionRow,
 } from '../../types.js'
 import { authenticateRequest, MemoryNonceStore, extractAuthHeaders } from '../../auth.js'
 
@@ -250,8 +251,42 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     )
   })
 
+  // --- Interest distribution history (issue #24, ?before=<ledger> cursor) ---
+  // One row per `interest` event: the amount the treasury collected and the
+  // active-member count at that distribution, so per-member share per
+  // distribution is derivable. `amount` is interest *collected* — the
+  // contract keeps the indivisible remainder, so it is slightly more than the
+  // sum credited to members (documented in the README).
+  app.get('/interest', async (req) => {
+    const q = req.query as Record<string, unknown>
+    const l = limit(q.limit)
+    const before = cursor(q.before)
+    const params: unknown[] = []
+    let where = ''
+    if (before !== null) {
+      params.push(before)
+      where = `WHERE ledger < $${params.length}`
+    }
+    params.push(l)
+    return query<InterestDistributionRow>(
+      `SELECT id, ledger, amount, active_members, tx_hash, created_at
+         FROM interest_distributions ${where}
+        ORDER BY ledger DESC, id DESC LIMIT $${params.length}`,
+      params
+    )
+  })
+
   // --- Aggregate stats (with indexer freshness — issue #2) ---
-  app.get('/stats', async (): Promise<DAOStats> => {
+  //
+  // Issue #18: /api/stats is the hottest endpoint (the frontend polls it
+  // every 15s from every tab, and proposal enumeration depends on it) and the
+  // most expensive (eight uncached counts). A short-lived in-process cache
+  // collapses a burst of polls to one set of queries. Scoped to this server
+  // instance — a fresh registerRoutes() closure per buildServer() — so it
+  // never leaks across tests or restarts.
+  let statsCache: { at: number; value: DAOStats } | null = null
+
+  async function computeStats(): Promise<DAOStats> {
     const row = await queryOne<{
       total_members: string
       active_members: string
@@ -262,6 +297,10 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       total_defaulted_value: string | null
       total_treasury_proposals: string
       total_staked: string | null
+      interest_collected: string | null
+      principal_lent: string | null
+      principal_repaid: string | null
+      value_defaulted: string | null
       last_ledger: number | null
       cursor_updated_at: string | null
     }>(
@@ -282,10 +321,13 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
          (SELECT COALESCE(sum(outstanding), 0) FROM loans WHERE status = 'defaulted') AS total_defaulted_value,
          (SELECT count(*) FROM treasury_proposals)                                 AS total_treasury_proposals,
          (SELECT COALESCE(sum(stake), 0) FROM members WHERE exited = false)         AS total_staked,
+         (SELECT interest_collected FROM dao_totals WHERE id = 1)                  AS interest_collected,
+         (SELECT principal_lent     FROM dao_totals WHERE id = 1)                  AS principal_lent,
+         (SELECT principal_repaid   FROM dao_totals WHERE id = 1)                  AS principal_repaid,
+         (SELECT value_defaulted    FROM dao_totals WHERE id = 1)                  AS value_defaulted,
          (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
          (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at`
     )
-    const lastLedger = row?.last_ledger ?? null
     const cursorUpdatedAt = row?.cursor_updated_at
     const secondsSinceUpdate = cursorUpdatedAt
       ? Math.floor((Date.now() - new Date(cursorUpdatedAt).getTime()) / 1000)
@@ -302,9 +344,24 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       totalDefaultedValue: String(row?.total_defaulted_value ?? '0'),
       totalTreasuryProposals: Number(row?.total_treasury_proposals ?? 0),
       totalStaked: String(row?.total_staked ?? '0'),
-      lastIndexedLedger: lastLedger,
+      interestCollected: String(row?.interest_collected ?? '0'),
+      principalLent: String(row?.principal_lent ?? '0'),
+      principalRepaid: String(row?.principal_repaid ?? '0'),
+      valueDefaulted: String(row?.value_defaulted ?? '0'),
+      lastIndexedLedger: row?.last_ledger ?? null,
       secondsSinceUpdate,
       indexerStale: isStale,
     }
+  }
+
+  app.get('/stats', async (_req, reply): Promise<DAOStats> => {
+    const ttl = config.http.statsCacheMs
+    reply.header('Cache-Control', `public, max-age=${Math.max(0, Math.floor(ttl / 1000))}`)
+    if (statsCache && Date.now() - statsCache.at < ttl) {
+      return statsCache.value
+    }
+    const value = await computeStats()
+    statsCache = { at: Date.now(), value }
+    return value
   })
 }

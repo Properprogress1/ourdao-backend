@@ -1,7 +1,7 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FastifyInstance } from 'fastify'
 import { buildServer } from '../src/api/server.js'
-import { query } from '../src/db/index.js'
+import { pool, query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
 
 describe('API: proposals, stats, events, admin/log', () => {
@@ -49,6 +49,11 @@ describe('API: proposals, stats, events, admin/log', () => {
        ON CONFLICT (id) DO UPDATE SET last_ledger = 999`
     )
 
+    await query(
+      `UPDATE dao_totals SET interest_collected = 4200, principal_lent = 9000,
+              principal_repaid = 3000, value_defaulted = 88 WHERE id = 1`
+    )
+
     const res = await app.inject({ method: 'GET', url: '/api/stats' })
     const body = res.json()
     // totalMembers is all-time (GA + GB), activeMembers is current (GA only) —
@@ -65,6 +70,31 @@ describe('API: proposals, stats, events, admin/log', () => {
     // Only GA's stake — GB exited, so their stale 50 is excluded.
     expect(body.totalStaked).toBe('100')
     expect(body.lastIndexedLedger).toBe(999)
+    // Lifetime money figures (issue #24), decimal strings.
+    expect(body.interestCollected).toBe('4200')
+    expect(body.principalLent).toBe('9000')
+    expect(body.principalRepaid).toBe('3000')
+    expect(body.valueDefaulted).toBe('88')
+  })
+
+  it('GET /api/stats is cached: a burst of calls issues one set of queries (issue #18)', async () => {
+    await query(`INSERT INTO indexer_cursor (id, last_ledger) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET last_ledger = 5`)
+    const spy = vi.spyOn(pool, 'query')
+    try {
+      const first = await app.inject({ method: 'GET', url: '/api/stats' })
+      const callsAfterFirst = spy.mock.calls.length
+      expect(callsAfterFirst).toBeGreaterThan(0)
+      expect(first.headers['cache-control']).toMatch(/max-age=/)
+
+      const second = await app.inject({ method: 'GET', url: '/api/stats' })
+      const third = await app.inject({ method: 'GET', url: '/api/stats' })
+      // No new DB queries for the cached responses.
+      expect(spy.mock.calls.length).toBe(callsAfterFirst)
+      expect(second.json()).toEqual(first.json())
+      expect(third.json()).toEqual(first.json())
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   it('GET /api/events filters by symbol and paginates with before=<ledger>', async () => {
@@ -106,5 +136,20 @@ describe('API: proposals, stats, events, admin/log', () => {
     const res = await app.inject({ method: 'GET', url: '/api/admin/log' })
     const body = res.json()
     expect(body.map((e: { symbol: string }) => e.symbol)).toEqual(['threshold', 'paused'])
+  })
+
+  it('GET /api/interest returns the distribution history, newest first, with a before-ledger cursor (issue #24)', async () => {
+    await query(
+      `INSERT INTO interest_distributions (event_id, ledger, amount, active_members) VALUES
+       ('i1', 10, 100, 2), ('i2', 20, 250, 5), ('i3', 30, 90, 3)`
+    )
+    const all = await app.inject({ method: 'GET', url: '/api/interest' })
+    expect(all.json().map((d: { ledger: number }) => d.ledger)).toEqual([30, 20, 10])
+
+    const paged = await app.inject({ method: 'GET', url: '/api/interest?before=30' })
+    const body = paged.json()
+    expect(body).toHaveLength(2)
+    expect(body.every((d: { ledger: number }) => d.ledger < 30)).toBe(true)
+    expect(body[0].amount).toBe('250')
   })
 })

@@ -1,17 +1,31 @@
 import type { rpc } from '@stellar/stellar-sdk'
 import { config, assertContractConfigured } from '../config.js'
 import { pool, queryOne } from '../db/index.js'
-import { server, getLatestLedger } from '../stellar/rpc.js'
+import { server, getLatestLedger, getLatestLedgerInfo } from '../stellar/rpc.js'
 import { decodeEvent } from '../stellar/events.js'
 import { applyEvent } from './handlers.js'
 
 interface CursorRow {
   paging_token: string | null
   last_ledger: number | null
+  last_ledger_hash: string | null
   contract_id: string | null
 }
 
 let stopped = false
+
+/** Thrown when the ledger sequence the indexer sees stops being monotonic —
+ *  the RPC's reported tip fell below our cursor, or a fetched page contains
+ *  an event from a ledger we already advanced past. It means history diverged
+ *  from what we folded (issue #23). The poll loop halts on this rather than
+ *  retrying; an operator re-indexes from the raw log (`npm run reindex`)
+ *  after confirming the true chain state. */
+export class ReorgDetectedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ReorgDetectedError'
+  }
+}
 
 // Derived tables rebuilt from the append-only `events` log. Wiped when the
 // indexer is deliberately repointed at a freshly deployed contract (issue
@@ -81,18 +95,23 @@ export async function ensureCursorContract(contractId: string): Promise<void> {
  *  resuming with another contract's paging_token. */
 async function loadCursor(contractId: string): Promise<CursorRow | null> {
   const row = await queryOne<CursorRow>(
-    'SELECT paging_token, last_ledger, contract_id FROM indexer_cursor WHERE id = 1'
+    'SELECT paging_token, last_ledger, last_ledger_hash, contract_id FROM indexer_cursor WHERE id = 1'
   )
   if (row && row.contract_id != null && row.contract_id !== contractId) return null
   return row
 }
 
-async function saveCursor(contractId: string, pagingToken: string | null, lastLedger: number): Promise<void> {
+async function saveCursor(
+  contractId: string,
+  pagingToken: string | null,
+  lastLedger: number,
+  lastLedgerHash: string | null
+): Promise<void> {
   await pool.query(
-    `INSERT INTO indexer_cursor (id, paging_token, last_ledger, contract_id, updated_at)
-     VALUES (1, $1, $2, $3, now())
-     ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, contract_id = $3, updated_at = now()`,
-    [pagingToken, lastLedger, contractId]
+    `INSERT INTO indexer_cursor (id, paging_token, last_ledger, last_ledger_hash, contract_id, updated_at)
+     VALUES (1, $1, $2, $3, $4, now())
+     ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, contract_id = $4, updated_at = now()`,
+    [pagingToken, lastLedger, lastLedgerHash, contractId]
   )
 }
 
@@ -108,22 +127,39 @@ async function resolveStartLedger(): Promise<number> {
   return Math.max(1, latest - config.indexer.startLookbackLedgers)
 }
 
-/** Persist a page of events + their derived side effects atomically. */
-async function ingestPage(events: rpc.Api.EventResponse[]): Promise<void> {
+/** Persist a page of events + their derived side effects atomically.
+ *  `lastLedger` is the highest ledger already folded — used for the
+ *  continuity check (issue #23). */
+async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): Promise<void> {
   if (events.length === 0) return
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
     for (const raw of events) {
       const ev = decodeEvent(raw)
+      // Continuity check (issue #23): getEvents returns events in ascending
+      // ledger order and we resume from a paging token, so a fetched event
+      // from *below* the ledger we already folded past means history diverged
+      // from what was applied. Halt rather than fold from a diverged chain.
+      if (typeof ev.ledger === 'number' && lastLedger > 0 && ev.ledger < lastLedger) {
+        throw new ReorgDetectedError(
+          `event ${ev.id} is from ledger ${ev.ledger}, below the last folded ledger ${lastLedger}`
+        )
+      }
       // Raw log first (idempotent on the unique event id), then derived state.
-      await client.query(
+      const ins = await client.query(
         `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (id) DO NOTHING`,
         [ev.id, ev.ledger, ev.closedAt, ev.contractId, ev.symbol, JSON.stringify(ev.topics), JSON.stringify(ev.data), ev.txHash]
       )
-      await applyEvent(client, ev)
+      // Fold only on first sight of an event id. A re-delivered page then
+      // can't re-apply increments (issue #24, and the vote-tally hazard) —
+      // raw insert and fold are in one transaction, so rowCount === 1 means
+      // "not yet folded".
+      if (ins.rowCount === 1) {
+        await applyEvent(client, ev)
+      }
     }
     await client.query('COMMIT')
   } catch (err) {
@@ -142,8 +178,18 @@ async function ingestPage(events: rpc.Api.EventResponse[]): Promise<void> {
  * DRAIN_MAX_PAGES and DRAIN_MAX_MS. The cursor is advanced after every page
  * so progress survives a mid-drain crash.
  */
-async function fetchOnce(contractId: string): Promise<void> {
+export async function fetchOnce(contractId: string): Promise<void> {
   const cursor = await loadCursor(contractId)
+
+  // Coarse rewind check (issue #23): if the RPC's reported tip is below the
+  // ledger we already folded to, the chain rewound past applied history.
+  const tip = await getLatestLedgerInfo()
+  const priorLedger = cursor?.last_ledger ?? 0
+  if (priorLedger > 0 && tip.sequence < priorLedger) {
+    throw new ReorgDetectedError(
+      `RPC latest ledger ${tip.sequence} is below the last folded ledger ${priorLedger} — the chain rewound past applied history`
+    )
+  }
 
   const base = {
     filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] as string[][] }],
@@ -164,7 +210,7 @@ async function fetchOnce(contractId: string): Promise<void> {
     const events = res.events ?? []
     const pageCount = events.length
 
-    await ingestPage(events)
+    await ingestPage(events, lastLedger)
     totalPages += 1
     totalEvents += pageCount
 
@@ -173,7 +219,7 @@ async function fetchOnce(contractId: string): Promise<void> {
     const nextToken = last?.id ?? res.cursor ?? currentRequest.cursor ?? null
     const pageLedger = last?.ledger ?? res.latestLedger ?? lastLedger
     if (nextToken !== cursor?.paging_token || pageLedger !== lastLedger) {
-      await saveCursor(contractId, nextToken, pageLedger)
+      await saveCursor(contractId, nextToken, pageLedger, tip.hash)
       lastLedger = pageLedger
     }
 
@@ -227,6 +273,17 @@ export async function runIndexer(): Promise<void> {
       await fetchOnce(contractId)
       consecutiveFailures = 0
     } catch (err) {
+      // A ledger discontinuity is not a transient error — retrying would
+      // fold events from a diverged history. Halt loudly (issue #23).
+      if (err instanceof ReorgDetectedError) {
+        console.error(`[indexer] LEDGER DISCONTINUITY DETECTED — halting the indexer. ${err.message}`)
+        console.error(
+          `[indexer] Recovery: confirm the true chain state, then run \`npm run reindex\` to rebuild ` +
+            `the derived tables from the raw events log. See README "Reorg detection".`
+        )
+        stopped = true
+        throw err
+      }
       const msg = err instanceof Error ? err.message : String(err)
       consecutiveFailures += 1
       delay = Math.min(
