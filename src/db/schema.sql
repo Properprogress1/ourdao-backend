@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_symbol_idx ON events (symbol);
 CREATE INDEX IF NOT EXISTS events_ledger_idx ON events (ledger);
+-- Supports the ?contract= filter on /api/events and /api/admin/log, added so
+-- a database that has held more than one CONTRACT_ID can be read per
+-- deployment (issue #16).
+CREATE INDEX IF NOT EXISTS events_contract_id_idx ON events (contract_id);
 
 CREATE TABLE IF NOT EXISTS members (
   address         TEXT PRIMARY KEY,

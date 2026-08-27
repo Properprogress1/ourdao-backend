@@ -77,6 +77,7 @@ CI provisions a throwaway `ourdao_test` database as a service container and does
 - **Indexer changes must be resumable.** The poll loop resumes from a persisted cursor (`indexer_cursor`), not from genesis. Don't introduce state that only exists in memory across polls.
 - **New contract events need a decoder.** When [`ourdao-contracts`](https://github.com/ourdao/ourdao-contracts) adds an event, `src/stellar/events.ts` needs the matching topic-symbol → data-tuple mapping, and usually a derived-table effect. Note in your PR description which contract commit introduced the event.
 - **Bigints serialize as strings.** JSON has no native 128-bit integer type. Keep the existing conversion discipline — don't let a raw bigint reach a response body.
+- **`NUMERIC(40,0)` for amounts, `BIGINT` only for sequences.** On-chain `i128` amounts are `NUMERIC(40,0)` and cross the API as strings. Ledger/sequence numbers are `BIGINT` and returned as JSON numbers via a `BIGINT → number` parser scoped to the pool in `src/db/index.ts`. A token amount stored as `BIGINT` would be parsed to a `number` and lose precision above 2⁵³ silently — never do that. See the README's [Database schema](./README.md#database-schema).
 - **Schema changes are additive where possible.** If you must change an existing column, say so explicitly in the PR description, since the schema is applied on boot against existing databases.
 
 ## What gets closed without review

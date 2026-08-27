@@ -31,7 +31,13 @@ describe('API: proposals, stats, events, admin/log', () => {
   })
 
   it('GET /api/stats aggregates across all domain tables', async () => {
-    await query(`INSERT INTO members (address, exited, stake) VALUES ('GA', false, 100), ('GB', true, 0)`)
+    // GA: active member with stake. GB: exited — a stale stake value that
+    // should be excluded from totalStaked (issue #13). GPHANTOM: a row with
+    // no join event (e.g. from name_reg) that must count for nothing (#14).
+    await query(
+      `INSERT INTO members (address, joined_ledger, exited, stake) VALUES
+       ('GA', 10, false, 100), ('GB', 20, true, 50), ('GPHANTOM', NULL, false, 0)`
+    )
     await query(`INSERT INTO loan_proposals (id, borrower, amount) VALUES (1, 'GA', 100)`)
     await query(
       `INSERT INTO loans (id, borrower, amount, outstanding, status) VALUES
@@ -45,13 +51,18 @@ describe('API: proposals, stats, events, admin/log', () => {
 
     const res = await app.inject({ method: 'GET', url: '/api/stats' })
     const body = res.json()
-    expect(body.totalMembers).toBe(1) // only the non-exited one
+    // totalMembers is all-time (GA + GB), activeMembers is current (GA only) —
+    // they must differ, matching the contract's two getters. GPHANTOM counts
+    // for neither.
+    expect(body.totalMembers).toBe(2)
+    expect(body.activeMembers).toBe(1)
     expect(body.totalLoans).toBe(3)
     expect(body.activeLoans).toBe(1)
     expect(body.defaultedLoans).toBe(1)
     expect(body.totalDefaultedValue).toBe('88')
     expect(body.totalLoanProposals).toBe(1)
     expect(body.totalTreasuryProposals).toBe(1)
+    // Only GA's stake — GB exited, so their stale 50 is excluded.
     expect(body.totalStaked).toBe('100')
     expect(body.lastIndexedLedger).toBe(999)
   })
@@ -70,6 +81,19 @@ describe('API: proposals, stats, events, admin/log', () => {
     const pagedBody = paged.json()
     expect(pagedBody).toHaveLength(2)
     expect(pagedBody.every((e: { ledger: number }) => e.ledger < 30)).toBe(true)
+  })
+
+  it('GET /api/events?contract= scopes the raw log to one deployment (issue #16)', async () => {
+    await query(
+      `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data) VALUES
+       ('a-0', 10, now(), 'COLD', 'joined', '[]', '[]'),
+       ('b-0', 20, now(), 'CNEW', 'joined', '[]', '[]'),
+       ('c-0', 30, now(), 'CNEW', 'staked', '[]', '[]')`
+    )
+    const scoped = await app.inject({ method: 'GET', url: '/api/events?contract=CNEW' })
+    const body = scoped.json()
+    expect(body).toHaveLength(2)
+    expect(body.every((e: { contract_id: string }) => e.contract_id === 'CNEW')).toBe(true)
   })
 
   it('GET /api/admin/log only returns admin/governance symbols, newest first', async () => {

@@ -1,17 +1,37 @@
-import { Pool, types, type PoolClient, type QueryResultRow } from 'pg'
+import { Pool, types as pgTypes, type PoolClient, type QueryResultRow } from 'pg'
 import { config } from '../config.js'
 
-// pg returns BIGINT (OID 20) as a string by default, to avoid silently
-// truncating values beyond Number.MAX_SAFE_INTEGER. Every BIGINT column in
-// this schema is a ledger sequence number (well under that range) and is
-// typed `number` in src/types.ts, so parse it as one instead.
-types.setTypeParser(20, (val: string) => Number.parseInt(val, 10))
+// pg returns Postgres BIGINT (OID 20) as a JS string by default — the safe
+// choice, since a BIGINT can exceed Number.MAX_SAFE_INTEGER and would
+// silently truncate on conversion. Every BIGINT column in *this* schema is a
+// ledger sequence number, comfortably inside that range and typed `number`
+// in src/types.ts, so we parse it as one.
+//
+// Issue #15: this parser is scoped to this pool's `types` config, NOT
+// installed on the process-wide `pg.types` registry — a global
+// `setTypeParser(20, …)` reached every pg consumer in the process and turned
+// "add a BIGINT column" into a silent-truncation trap. Kept here so the
+// assumption is visible and local. The column-type rule it depends on —
+// on-chain i128 amounts are NUMERIC(40,0) and come back as decimal strings,
+// never BIGINT — is documented in the README ("Database schema") and
+// CONTRIBUTING.md.
+const BIGINT_OID = 20
+const parseBigIntAsNumber = (value: string): number => Number.parseInt(value, 10)
+
+const scopedGetTypeParser = ((oid: number, format?: 'text' | 'binary') =>
+  oid === BIGINT_OID
+    ? parseBigIntAsNumber
+    : format === 'binary'
+      ? pgTypes.getTypeParser(oid, 'binary')
+      : pgTypes.getTypeParser(oid, 'text')
+) as unknown as typeof pgTypes.getTypeParser
 
 // A single shared pool. pg picks up PG* env vars automatically; a
 // DATABASE_URL connection string takes precedence when provided.
-export const pool = new Pool(
-  config.db.connectionString ? { connectionString: config.db.connectionString } : {}
-)
+export const pool = new Pool({
+  ...(config.db.connectionString ? { connectionString: config.db.connectionString } : {}),
+  types: { getTypeParser: scopedGetTypeParser },
+})
 
 pool.on('error', (err) => {
   // Background idle-client errors shouldn't crash the process.

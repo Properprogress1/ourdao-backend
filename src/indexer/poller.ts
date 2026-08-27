@@ -13,6 +13,68 @@ interface CursorRow {
 
 let stopped = false
 
+// Derived tables rebuilt from the append-only `events` log. Wiped when the
+// indexer is deliberately repointed at a freshly deployed contract (issue
+// #16); `events` itself is kept as the audit trail.
+const DERIVED_TABLES = ['members', 'loan_proposals', 'loans', 'treasury_proposals', 'notifications'] as const
+
+/** Wipe the cursor and every derived table so the indexer can re-index a new
+ *  deployment from an empty slate. Destructive — only reached when
+ *  INDEXER_RESET_ON_CONTRACT_CHANGE is set. */
+export async function resetForContractChange(): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query(`TRUNCATE ${DERIVED_TABLES.join(', ')} RESTART IDENTITY`)
+    await client.query('DELETE FROM indexer_cursor WHERE id = 1')
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+/**
+ * Guard against silently merging two deployments' state (issue #16). The
+ * OurDAO contract has no upgrade path, so every fix is a fresh deployment
+ * with a new CONTRACT_ID — and proposal/loan ids restart at 0, so the new
+ * contract's rows would collide with the old one's under `ON CONFLICT (id)
+ * DO UPDATE`.
+ *
+ * If the saved cursor was last advanced for a different contract, refuse to
+ * start with an actionable error. Setting INDEXER_RESET_ON_CONTRACT_CHANGE
+ * instead wipes the cursor + derived tables and re-indexes from scratch.
+ * No-op when the cursor is absent or already matches.
+ */
+export async function ensureCursorContract(contractId: string): Promise<void> {
+  const row = await queryOne<{ contract_id: string | null }>(
+    'SELECT contract_id FROM indexer_cursor WHERE id = 1'
+  )
+  const saved = row?.contract_id ?? null
+  if (saved === null || saved === contractId) return
+
+  if (config.indexer.resetOnContractChange) {
+    console.warn(
+      `[indexer] CONTRACT_ID changed (${saved} -> ${contractId}) and ` +
+        `INDEXER_RESET_ON_CONTRACT_CHANGE is set: wiping the cursor and derived ` +
+        `tables (${DERIVED_TABLES.join(', ')}) and re-indexing the new contract ` +
+        `from scratch. The raw events log is left intact.`
+    )
+    await resetForContractChange()
+    return
+  }
+
+  throw new Error(
+    `Indexer cursor belongs to contract ${saved}, but CONTRACT_ID is now ${contractId}. ` +
+      `Resuming would merge two deployments' derived state in one database. ` +
+      `To repoint at a new deployment: start once with INDEXER_RESET_ON_CONTRACT_CHANGE=true ` +
+      `to wipe the cursor and derived tables, or point DATABASE_URL at a fresh database. ` +
+      `See the README's "Redeploying the contract" section.`
+  )
+}
+
 /** Loads the saved cursor, but only if it belongs to `contractId` — a
  *  cursor saved under a different contract (CONTRACT_ID changed since the
  *  last run) is treated as absent so the indexer cold-starts instead of
@@ -156,6 +218,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
  *  to the normal interval as soon as a poll succeeds. */
 export async function runIndexer(): Promise<void> {
   const contractId = assertContractConfigured()
+  await ensureCursorContract(contractId)
   console.log(`[indexer] watching ${contractId} on ${config.stellar.rpcUrl}`)
   let consecutiveFailures = 0
   while (!stopped) {

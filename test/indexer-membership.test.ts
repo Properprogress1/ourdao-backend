@@ -68,6 +68,21 @@ describe('indexer handlers: membership', () => {
     expect(rows[0]?.exited_ledger).toBe(exitEv.ledger)
   })
 
+  it('exited zeroes the member\'s stake and clears has_active_loan, mirroring exit_dao (issue #13)', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GFRANK', fee: '100' }))
+    await applyEvent(client, decodedEvent('staked', { member: 'GFRANK', amount: '400', new_stake: '400' }))
+    await applyEvent(client, decodedEvent('claimed', { member: 'GFRANK', pending: '25' }))
+    await applyEvent(client, decodedEvent('loan_appr', { id: 950, borrower: 'GFRANK', amount: '1' }))
+    await applyEvent(client, decodedEvent('exited', { member: 'GFRANK', share: '150' }))
+
+    const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GFRANK'])
+    expect(rows[0]?.stake).toBe('0')
+    expect(rows[0]?.has_active_loan).toBe(false)
+    // pending_claimed is an indexer-only lifetime counter and is intentionally
+    // NOT reset on exit.
+    expect(rows[0]?.pending_claimed).toBe('25')
+  })
+
   it('claimed accumulates pending_claimed for the member across multiple claims', async () => {
     await applyEvent(client, decodedEvent('joined', { member: 'GDAVE', fee: '10' }))
     await applyEvent(client, decodedEvent('claimed', { member: 'GDAVE', pending: '30' }))
