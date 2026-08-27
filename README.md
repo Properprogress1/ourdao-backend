@@ -89,7 +89,14 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `START_LEDGER` / `START_LOOKBACK_LEDGERS` | Where to start indexing on a cold start. Public Soroban RPC only retains ~24h of events, so an old start ledger gets clamped to the oldest the RPC still serves. |
 | `POLL_INTERVAL_MS` / `EVENTS_PAGE_LIMIT` | Indexer poll cadence and page size. |
 | `POLL_MAX_BACKOFF_MS` | Cap for exponential backoff after consecutive poll failures (default 60s). |
-| `CORS_ORIGIN` | Comma-separated allowed origins for the API (the frontend's URL). |
+| `DRAIN_MAX_PAGES` | Max pages per poll drain cycle when catching up (default 20). |
+| `DRAIN_MAX_MS` | Max wall-clock ms for a single drain cycle (default 30s). |
+| `INDEXER_STALE_AFTER_MS` | How long (ms) the cursor can be idle before `/ready` reports stale (default 120s). |
+| `CORS_ORIGIN` | Comma-separated allowed origins for the API (the frontend's URL). Defaults to `http://localhost:3000`. Set to `*` to allow all origins (a warning is logged at startup). |
+| `RATE_LIMIT_MAX` | Global rate limit: max requests per window per IP (default 100). |
+| `RATE_LIMIT_WINDOW_MS` | Rate limit window in milliseconds (default 60000). |
+| `RATE_LIMIT_EVENTS_MAX` | Stricter rate limit for `GET /api/events` (default 30). |
+| `TRUST_PROXY` | Set to `"true"` behind a reverse proxy so rate limits apply per client IP. |
 | `TEST_DATABASE_URL` | Separate database `npm test` runs against — never the dev DB. |
 
 ## Database schema
@@ -140,7 +147,8 @@ Base path: `/api`.
 
 | Method & path | Description |
 |---|---|
-| `GET /health` | Liveness check + the currently configured contract id. |
+| `GET /health` | Liveness check + the currently configured contract id. No DB round trip. |
+| `GET /ready` | Readiness probe — checks Postgres reachability and indexer freshness. Returns `503` with a `reason` when Postgres is down or the indexer cursor is stale. |
 | `GET /api/stats` | Aggregate counts (members, loans, proposals) + the last indexed ledger. |
 | `GET /api/members` | Active members. |
 | `GET /api/members/:address` | Single member. |
@@ -178,8 +186,9 @@ Tests apply the real `schema.sql` and truncate all tables between runs (`test/db
 
 - **No custody, ever.** This service holds no private keys and has no code path that constructs, signs, or submits a transaction. It is a read model over public on-chain events.
 - **Fail-soft, not fail-open.** If the indexer falls behind or the RPC endpoint is unreachable, reads degrade to stale/empty data (surfaced to the frontend as such) rather than the API crashing or serving incorrect state.
-- **CORS is explicit.** `CORS_ORIGIN` defaults to `http://localhost:3000` in the example config — a production deployment should set this to the real frontend origin rather than `*`.
+- **CORS is explicit.** `CORS_ORIGIN` defaults to `http://localhost:3000` in both code and config — a production deployment should set this to the real frontend origin. Setting it to `*` is supported as an explicit opt-in but logs a warning at startup.
 - **Input handling.** All route parameters (addresses, ids, cursors) are validated before being used in parameterized queries — no raw string interpolation into SQL anywhere in the codebase.
+- **Rate limiting.** Global rate limiting (`@fastify/rate-limit`) is applied to all API endpoints, with a stricter per-route limit on `GET /api/events`. Health and readiness probes are exempt. Behind a reverse proxy, set `TRUST_PROXY=true` so limits apply per client IP. With in-process limiting, the effective global limit is `RATE_LIMIT_MAX × instance count`.
 
 ## Status
 
