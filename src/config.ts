@@ -45,6 +45,13 @@ export const config = {
     rateLimitWindowMs: int('RATE_LIMIT_WINDOW_MS', 60_000),
     rateLimitEventsMax: int('RATE_LIMIT_EVENTS_MAX', 30),
     trustProxy: str('TRUST_PROXY', 'false'),
+    // How long (ms) an in-process /api/stats result is reused before it is
+    // recomputed (issue #18). A burst of polls inside this window collapses
+    // to one set of queries. The reported figures — counts and the freshness
+    // signal alike — are then at most this stale, which is well under
+    // INDEXER_STALE_AFTER_MS. In-process only: with more than one API
+    // instance they may briefly disagree.
+    statsCacheMs: int('STATS_CACHE_MS', 5_000),
   },
   db: {
     // pg reads PG* env vars automatically; connectionString wins when set.

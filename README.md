@@ -97,6 +97,7 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `RATE_LIMIT_MAX` | Global rate limit: max requests per window per IP (default 100). |
 | `RATE_LIMIT_WINDOW_MS` | Rate limit window in milliseconds (default 60000). |
 | `RATE_LIMIT_EVENTS_MAX` | Stricter rate limit for `GET /api/events` (default 30). |
+| `STATS_CACHE_MS` | How long (ms) an `/api/stats` result is cached in-process before it is recomputed (default 5000; `0` disables). Reported figures are at most this stale. |
 | `TRUST_PROXY` | Set to `"true"` behind a reverse proxy so rate limits apply per client IP. |
 | `TEST_DATABASE_URL` | Separate database `npm test` runs against — never the dev DB. |
 
@@ -153,7 +154,7 @@ The full topic-symbol → data-tuple mapping this service decodes (kept in sync 
 | `loan_appr` | `id, borrower, amount`, plus a reserved `due_time` not yet published | marks the proposal approved, opens a `loans` row seeded with `total_repayment` from the matching proposal (not the bare principal — see below), flags the borrower's `has_active_loan` |
 | `loan_rpy` | `loan_id, borrower, outstanding` | updates outstanding balance; marks `repaid` when it hits zero |
 | `loan_dflt` | `loan_id, borrower, penalty` | marks the loan `defaulted`, slashes the borrower's `contribution` by the penalty (clamped at zero), bumps `defaults_count`, clears `has_active_loan` — idempotent, so redelivering the same event is a no-op past the first application |
-| `interest` | `interest, active` | no per-member payload — retained in the raw event log only |
+| `interest` | `interest, active` | no per-member breakdown to attribute, but folded into `dao_totals.interest_collected` and one `interest_distributions` row (issue #24). `interest` is interest *collected* — the contract keeps the indivisible per-member remainder, so it slightly exceeds what members were credited. Per-member yield is still surfaced via `claimed`. |
 | `tre_prop` | `id, amount, destination, private` | inserts a pending `treasury_proposals` row |
 | `tre_vote` | `id, voter, support`, plus a reserved `weight` not yet published | adds the vote's weight to the tally, bumps `voter_count` |
 | `tre_exec` | `id, amount, destination` | marks the proposal executed, notifies the recipient |
@@ -172,7 +173,8 @@ Base path: `/api`.
 |---|---|
 | `GET /health` | Liveness check + the currently configured contract id. No DB round trip. |
 | `GET /ready` | Readiness probe — checks Postgres reachability and indexer freshness. Returns `503` with a `reason` when Postgres is down or the indexer cursor is stale. |
-| `GET /api/stats` | Aggregate counts (members, loans, proposals) + defaulted-loan count/value + the last indexed ledger. |
+| `GET /api/stats` | Aggregate counts (members, loans, proposals) + defaulted-loan count/value + lifetime money figures (`interestCollected`, `principalLent`, `principalRepaid`, `valueDefaulted`, all decimal strings) + the last indexed ledger. Cached in-process for `STATS_CACHE_MS`; sets `Cache-Control`. With more than one API instance the cached figures may briefly disagree. |
+| `GET /api/interest` | Interest-distribution history — one row per `interest` event (`amount` collected, `active_members` at that distribution). `?before=<ledger>` cursor. |
 | `GET /api/members` | Active members. |
 | `GET /api/members/:address` | Single member. |
 | `GET /api/proposals/loan` | Loan proposals with stake-weighted vote tallies (`votes_for`/`votes_against`) and a distinct `voter_count`. |
@@ -186,6 +188,26 @@ Base path: `/api`.
 | `GET /api/admin/log` | Admin/governance audit trail — init, admin add/remove, threshold changes, policy changes, pause/unpause. |
 
 All list endpoints accept `?limit=` (default 50, max 200). `?before=` is a cursor: pass the `id`/`ledger` of the last row you saw to page further back. On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
+
+### Reorg detection
+
+Stellar's consensus gives fast finality, so a deep reorg is genuinely unlikely — but the indexer now *notices* one rather than silently folding events from a diverged history (issue #23):
+
+- The cursor stores `last_ledger` (and `last_ledger_hash`, the RPC tip hash at each advance — Soroban's `getEvents` exposes no per-event ledger hash, so deeper verification isn't possible).
+- Each poll checks continuity: if the RPC's reported latest ledger is **below** the last folded ledger, or a fetched page contains an event from a ledger already folded past, the indexer **halts** with a loud log line instead of retrying.
+- **Recovery:** confirm the true chain state, then run `npm run reindex` (`node dist/indexer/reindex.js` in the container). It truncates the derived tables and rebuilds them from the raw `events` log in one transaction — the log is authoritative and untouched. A rebuild produces state identical to the incremental fold (asserted by a test), so `reindex` is also the repair path for the historical-data bugs tracked in other issues.
+- **Unrecoverable:** events that were orphaned *and* already pruned from the RPC's ~24h window can't be re-fetched; `reindex` rebuilds from whatever the raw log holds.
+
+### Docker
+
+```bash
+docker build -t ourdao-backend .
+docker run --env-file .env -p 4000:4000 ourdao-backend            # API (default CMD)
+docker run --env-file .env ourdao-backend node dist/worker.js      # indexer
+docker run --env-file .env ourdao-backend node dist/indexer/reindex.js   # one-off rebuild
+```
+
+The image runs as the non-root `node` user, uses `tini` as PID 1, and has a `HEALTHCHECK` against `/health`. Both processes migrate on startup, so no separate migrate step is needed.
 
 ## Testing
 
@@ -217,7 +239,7 @@ Tests apply the real `schema.sql` and truncate all tables between runs (`test/db
 
 MVP — the indexer and read API are implemented for the full event catalog, including loan defaults, with test coverage across every indexer handler and API route. Known gaps:
 
-- No reorg handling — Soroban/Stellar finality makes deep reorgs very unlikely in practice, but the indexer doesn't currently detect or recover from one if it happened.
+- Reorg handling is *detection only* — the indexer halts on a ledger discontinuity and an operator rebuilds derived state from the raw log with `npm run reindex` (see [Reorg detection](#reorg-detection)). There is no automatic rollback and replay of orphaned events.
 - Single indexer instance — no leader-election or multi-instance coordination if you wanted to run more than one worker for redundancy.
 - IPFS pinning for document metadata is a frontend/contract-facing concern (`ourdao-frontend`'s `lib/ipfs.ts`), not something this service indexes today beyond the raw `doc_attn` event.
 

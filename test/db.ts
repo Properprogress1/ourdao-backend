@@ -32,11 +32,21 @@ const TABLES = [
   'members',
   'events',
   'indexer_cursor',
+  'interest_distributions',
 ]
 
 export async function resetDb(): Promise<void> {
   await ensureSchema()
   await pool.query(`TRUNCATE ${TABLES.join(', ')} RESTART IDENTITY CASCADE`)
+  // dao_totals is a fixed singleton — reset its values in place and make sure
+  // the row exists (schema.sql seeds it, but be defensive against a partial
+  // apply during test bootstrap).
+  await pool.query(
+    `INSERT INTO dao_totals (id) VALUES (1)
+     ON CONFLICT (id) DO UPDATE
+       SET interest_collected = 0, principal_lent = 0,
+           principal_repaid = 0, value_defaulted = 0, updated_at = now()`
+  )
 }
 
 export async function closeDb(): Promise<void> {
