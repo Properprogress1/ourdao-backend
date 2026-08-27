@@ -25,6 +25,16 @@ describe('API: members and loans', () => {
     expect(body.map((m: { address: string }) => m.address)).toEqual(['GNEW', 'GOLD'])
   })
 
+  it('GET /api/members excludes phantom rows with no join event (issue #14)', async () => {
+    await query(
+      `INSERT INTO members (address, joined_ledger, exited) VALUES
+       ('GREAL', 100, false), ('GPHANTOM', NULL, false)`
+    )
+    const res = await app.inject({ method: 'GET', url: '/api/members' })
+    const body = res.json()
+    expect(body.map((m: { address: string }) => m.address)).toEqual(['GREAL'])
+  })
+
   it('GET /api/members/:address 404s for an unknown address', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/members/GNOBODY' })
     expect(res.statusCode).toBe(404)

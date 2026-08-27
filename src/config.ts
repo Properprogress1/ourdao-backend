@@ -12,6 +12,12 @@ function int(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback
 }
 
+function bool(name: string, fallback = false): boolean {
+  const v = process.env[name]
+  if (v === undefined || v === '') return fallback
+  return v === 'true' || v === '1'
+}
+
 /**
  * Parse the CORS_ORIGIN env var into a Fastify-compatible origin value.
  *
@@ -62,6 +68,13 @@ export const config = {
     maxDrainMs: int('DRAIN_MAX_MS', 30_000),
     // How long (ms) the indexer cursor can be idle before /ready reports stale.
     staleAfterMs: int('INDEXER_STALE_AFTER_MS', 120_000),
+    // When CONTRACT_ID no longer matches the contract the saved cursor was
+    // last advanced for (a redeploy — the contract has no upgrade path), the
+    // indexer refuses to start so two deployments' state can't merge (issue
+    // #16). Set this to `true` for exactly one boot to wipe the cursor and
+    // every derived table and re-index the new contract from scratch. The
+    // raw `events` log is left intact as an audit trail.
+    resetOnContractChange: bool('INDEXER_RESET_ON_CONTRACT_CHANGE', false),
   },
 } as const
 

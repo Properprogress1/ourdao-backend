@@ -92,6 +92,7 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `DRAIN_MAX_PAGES` | Max pages per poll drain cycle when catching up (default 20). |
 | `DRAIN_MAX_MS` | Max wall-clock ms for a single drain cycle (default 30s). |
 | `INDEXER_STALE_AFTER_MS` | How long (ms) the cursor can be idle before `/ready` reports stale (default 120s). |
+| `INDEXER_RESET_ON_CONTRACT_CHANGE` | `true` for one boot to wipe the cursor + derived tables when `CONTRACT_ID` changes (redeploy). Default `false` — a mismatch refuses to start. See [Redeploying the contract](#redeploying-the-contract). |
 | `CORS_ORIGIN` | Comma-separated allowed origins for the API (the frontend's URL). Defaults to `http://localhost:3000`. Set to `*` to allow all origins (a warning is logged at startup). |
 | `RATE_LIMIT_MAX` | Global rate limit: max requests per window per IP (default 100). |
 | `RATE_LIMIT_WINDOW_MS` | Rate limit window in milliseconds (default 60000). |
@@ -120,9 +121,22 @@ To add a schema change: update `schema.sql` to the new desired shape (for fresh 
 
 On-chain `i128` amounts are stored as `NUMERIC(40,0)` (an i128's max value is ~1.7×10³⁸, which fits under 10³⁹) and returned from the API as **decimal strings**, never JSON numbers, to avoid silent precision loss — this was in fact a real bug found and fixed during development: `pg` returns Postgres `BIGINT` columns as JS strings by default, and the original code assumed they came back as numbers.
 
+**Column-type rule for amounts vs. sequences.** On-chain `i128` amounts are `NUMERIC(40,0)` and cross the API boundary as strings. Ledger sequence numbers are `BIGINT` and are returned as JSON numbers — `src/db/index.ts` registers a `BIGINT → number` parser **scoped to this repo's connection pool**, not on the process-wide `pg.types` registry (a global parser silently truncated any `BIGINT` above 2⁵³, for every pg consumer in the process). Nothing else should be `BIGINT`: a token amount stored as `BIGINT` would be parsed to a `number` by that pool parser and lose precision above 2⁵³ with no error. Use `NUMERIC(40,0)` for any new amount column, and only `BIGINT` for a genuine ledger/sequence value.
+
 **Vote tallies are stake-weighted, not a headcount.** The contract grants each voter `1 + min(stake / STAKE_WEIGHT_UNIT, MAX_STAKE_BONUS)` voting power (currently up to 6) and sums that into `for_votes`/`against_votes`. `votes_for`/`votes_against` mirror that (hence `NUMERIC(40,0)`, matching the contract's own field width, not a plain vote count); `voter_count` is the distinct-voter headcount alongside it, so a client can show both "7 members voted" and "carrying 19 voting power." **The contract doesn't publish the weight it applied yet** — `loan_vote`/`tre_vote`/`revealed` currently carry only `support` — so today every vote folds in as weight 1 regardless of stake, and `votes_for`/`votes_against` under-count for any staked voter until [the upstream fix](https://github.com/ourdao/ourdao-contracts) lands. The decoder and handlers already read a `weight` field the moment the contract adds one, with no further backend change needed.
 
 **A loan's `outstanding` balance starts at `total_repayment`, not the principal.** The contract collects `total_repayment = amount + interest` on `repay_loan`, so a loan is never worth just its principal from a borrower's perspective. `loan_appr` doesn't publish `total_repayment` (only the disbursed `amount`), so the indexer sources it from the just-approved `loan_proposals` row instead — `loans.id == loan_proposals.id` is a documented contract invariant, and that row already carries `total_repayment` from `loan_req`/`loan_edit`. This depends on that proposal row existing, which it will unless the indexer started mid-history; if it's missing, `total_repayment` falls back to the principal. `due_time` has the same gap — the contract computes it but doesn't publish it on `loan_appr` — so it's `NULL` until that's fixed upstream. `GET /api/loans` and `/api/loans/:id` also expose `interest_charge` and `repaid_amount`, both derived from `total_repayment` at read time.
+
+### Redeploying the contract
+
+The OurDAO contract has **no upgrade path** — every fix is a fresh deployment with a new `CONTRACT_ID`. Proposal and loan ids restart at 0 for a new deployment, and `loans.id` / `loan_proposals.id` are primary keys, so pointing an existing database at a new contract would silently merge two deployments' state (the new contract's proposal 0 overwriting the old one's under `ON CONFLICT (id) DO UPDATE`, members' contributions blending, and so on).
+
+The indexer records which contract its cursor belongs to (`indexer_cursor.contract_id`). When `CONTRACT_ID` no longer matches, it **refuses to start** rather than resume. To repoint at a new deployment, choose one:
+
+- **Fresh database (recommended):** point `DATABASE_URL` at a new, empty database. The old deployment's indexed history stays queryable where it is.
+- **Reuse the database:** start the worker once with `INDEXER_RESET_ON_CONTRACT_CHANGE=true`. This truncates the cursor and every derived table (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) and re-indexes the new contract from scratch. The append-only `events` log is **kept** — pass `?contract=<C...>` to `GET /api/events` and `GET /api/admin/log` to scope the raw log to one deployment. Unset the flag again after the first successful boot.
+
+Running one database against multiple contracts simultaneously is deliberately not supported — the derived tables are single-contract by construction.
 
 ## Event catalog
 

@@ -74,9 +74,17 @@ const handlers: Record<string, Handler> = {
   async exited(client, ev) {
     const f = ev.fields
     const member = addr(f.member)
+    // Mirror the contract's exit_dao (issue #13): it zeroes the member's
+    // stake (and decrements total_staked), and exit requires no active loan,
+    // so the indexer row must reflect both. `pending_claimed` is left as-is
+    // on purpose — it's an indexer-only *lifetime* counter of yield ever
+    // claimed, with no on-chain equivalent to reset; the pending yield the
+    // contract pays out on exit was already surfaced by its own `claimed`
+    // events, so clearing the lifetime total here would lose history.
     await client.query(
       `UPDATE members
-         SET exited = true, exit_share = $2, exited_ledger = $3, updated_at = now()
+         SET exited = true, exit_share = $2, exited_ledger = $3,
+             stake = 0, has_active_loan = false, updated_at = now()
        WHERE address = $1`,
       [member, str(f.share), ev.ledger]
     )
@@ -265,10 +273,15 @@ const handlers: Record<string, Handler> = {
   },
 
   async staked(client, ev) {
+    // UPDATE only, never INSERT (issue #14). The contract requires membership
+    // to stake, but this indexer can't enforce that guarantee, and a read
+    // model shouldn't materialise a member row just because an event named an
+    // address. A `staked` for an unknown address is still in the raw `events`
+    // log; it just doesn't create a phantom member. Same reasoning as
+    // `name_reg`, and identical to `unstaked` now.
     const f = ev.fields
     await client.query(
-      `INSERT INTO members (address, stake, updated_at) VALUES ($1, $2, now())
-       ON CONFLICT (address) DO UPDATE SET stake = EXCLUDED.stake, updated_at = now()`,
+      `UPDATE members SET stake = $2, updated_at = now() WHERE address = $1`,
       [addr(f.member), str(f.new_stake)]
     )
   },
@@ -282,10 +295,24 @@ const handlers: Record<string, Handler> = {
   },
 
   async name_reg(client, ev) {
+    // UPDATE only, never INSERT (issue #14). The contract's register_name
+    // authorizes the caller but does *not* check membership, unlike every
+    // other member-facing entrypoint — so anyone on the network can register
+    // a name. Upserting here let a non-member insert itself into `members`
+    // (contribution 0, joined_ledger NULL) and be served by /api/members and
+    // counted by /api/stats. The name is still recorded in the raw `events`
+    // log; it just no longer creates a member.
+    //
+    // Ordering edge case: if `name_reg` somehow arrives before the `joined`
+    // event for the same address (possible only on a cold start whose start
+    // ledger was clamped past the join), this UPDATE is a no-op and the name
+    // is lost. We accept that rather than carry a pending-names side table:
+    // `register_member` builds a fresh Member record on join and the name is
+    // re-registrable at any time, so the fix is a re-register, and the raw
+    // event is retained regardless.
     const f = ev.fields
     await client.query(
-      `INSERT INTO members (address, name, updated_at) VALUES ($1, $2, now())
-       ON CONFLICT (address) DO UPDATE SET name = EXCLUDED.name, updated_at = now()`,
+      `UPDATE members SET name = $2, updated_at = now() WHERE address = $1`,
       [addr(f.owner), typeof f.name === 'string' ? f.name : String(f.name ?? '')]
     )
   },

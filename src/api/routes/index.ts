@@ -62,10 +62,15 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   })
   
   // --- Members ---
+  // `joined_ledger IS NOT NULL` filters out phantom rows — an address that
+  // only ever appeared in a `name_reg`/`staked` event and never actually
+  // joined the DAO (issue #14). A real member always has a join ledger.
   app.get('/members', async (req) => {
     const l = limit((req.query as Record<string, unknown>).limit)
     return query<MemberRow>(
-      `SELECT * FROM members WHERE exited = false ORDER BY joined_ledger DESC NULLS LAST LIMIT $1`,
+      `SELECT * FROM members
+        WHERE exited = false AND joined_ledger IS NOT NULL
+        ORDER BY joined_ledger DESC NULLS LAST LIMIT $1`,
       [l]
     )
   })
@@ -144,12 +149,20 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     const l = limit(q.limit)
     const before = cursor(q.before)
     const symbol = typeof q.symbol === 'string' && q.symbol ? q.symbol : null
+    // `?contract=<C...>` scopes the raw log to one deployment (issue #16).
+    // The column is always populated; without this filter a database that
+    // has held more than one CONTRACT_ID interleaves both.
+    const contract = typeof q.contract === 'string' && q.contract ? q.contract : null
 
     const conditions: string[] = []
     const params: unknown[] = []
     if (symbol) {
       params.push(symbol)
       conditions.push(`symbol = $${params.length}`)
+    }
+    if (contract) {
+      params.push(contract)
+      conditions.push(`contract_id = $${params.length}`)
     }
     if (before !== null) {
       params.push(before)
@@ -220,10 +233,20 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   // --- Admin/governance audit log (init, admin add/remove, threshold,
   // policy, pause/unpause) ---
   app.get('/admin/log', async (req) => {
-    const l = limit((req.query as Record<string, unknown>).limit)
+    const q = req.query as Record<string, unknown>
+    const l = limit(q.limit)
+    // `?contract=<C...>` scopes to one deployment, same as /events (issue #16).
+    const contract = typeof q.contract === 'string' && q.contract ? q.contract : null
+    const params: unknown[] = [ADMIN_EVENT_SYMBOLS as unknown as string[]]
+    let where = `WHERE symbol = ANY($1)`
+    if (contract) {
+      params.push(contract)
+      where += ` AND contract_id = $${params.length}`
+    }
+    params.push(l)
     return query<EventRow>(
-      `SELECT * FROM events WHERE symbol = ANY($1) ORDER BY ledger DESC LIMIT $2`,
-      [ADMIN_EVENT_SYMBOLS as unknown as string[], l]
+      `SELECT * FROM events ${where} ORDER BY ledger DESC LIMIT $${params.length}`,
+      params
     )
   })
 
@@ -242,16 +265,23 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       last_ledger: number | null
       cursor_updated_at: string | null
     }>(
+      // Member counts mirror the contract's two distinct getters:
+      // get_total_members (all-time) vs get_active_members (current). Both
+      // require a real join event — `joined_ledger IS NOT NULL` — so phantom
+      // rows from a name/stake event never count (issue #14). total_staked
+      // sums only non-exited members: the `exited` handler now zeroes stake
+      // (issue #13), and this WHERE is defence in depth so a future handler
+      // gap can't re-inflate the figure.
       `SELECT
-         (SELECT count(*) FROM members WHERE exited = false)                       AS total_members,
-         (SELECT count(*) FROM members WHERE exited = false)                       AS active_members,
+         (SELECT count(*) FROM members WHERE joined_ledger IS NOT NULL)             AS total_members,
+         (SELECT count(*) FROM members WHERE joined_ledger IS NOT NULL AND exited = false) AS active_members,
          (SELECT count(*) FROM loan_proposals)                                     AS total_loan_proposals,
          (SELECT count(*) FROM loans)                                              AS total_loans,
          (SELECT count(*) FROM loans WHERE status = 'active')                      AS active_loans,
          (SELECT count(*) FROM loans WHERE status = 'defaulted')                   AS defaulted_loans,
          (SELECT COALESCE(sum(outstanding), 0) FROM loans WHERE status = 'defaulted') AS total_defaulted_value,
          (SELECT count(*) FROM treasury_proposals)                                 AS total_treasury_proposals,
-         (SELECT COALESCE(sum(stake), 0) FROM members)                             AS total_staked,
+         (SELECT COALESCE(sum(stake), 0) FROM members WHERE exited = false)         AS total_staked,
          (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
          (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at`
     )

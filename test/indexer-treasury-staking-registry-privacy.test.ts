@@ -107,13 +107,21 @@ describe('indexer handlers: staking', () => {
   })
   afterEach(() => client.release())
 
-  it('staked upserts a member row with the new stake even if they have no prior row', async () => {
+  it('staked updates the stake on an existing member', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GSTAKER', fee: '10' }))
     await applyEvent(client, decodedEvent('staked', { member: 'GSTAKER', amount: '100', new_stake: '100' }))
     const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GSTAKER'])
     expect(rows[0]?.stake).toBe('100')
   })
 
+  it('staked for an address with no join event creates no member row (issue #14)', async () => {
+    await applyEvent(client, decodedEvent('staked', { member: 'GNOTAMEMBER', amount: '100', new_stake: '100' }))
+    const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GNOTAMEMBER'])
+    expect(rows).toHaveLength(0)
+  })
+
   it('unstaked lowers the stake on an existing member', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GSTAKER', fee: '10' }))
     await applyEvent(client, decodedEvent('staked', { member: 'GSTAKER', amount: '100', new_stake: '100' }))
     await applyEvent(client, decodedEvent('unstaked', { member: 'GSTAKER', amount: '40', new_stake: '60' }))
     const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GSTAKER'])
@@ -130,13 +138,21 @@ describe('indexer handlers: registry', () => {
   })
   afterEach(() => client.release())
 
-  it('name_reg upserts a member row with the registered name', async () => {
+  it('name_reg sets the name on an existing member', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GALICE', fee: '10' }))
     await applyEvent(client, decodedEvent('name_reg', { name: 'alice.our', owner: 'GALICE' }))
     const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GALICE'])
     expect(rows[0]?.name).toBe('alice.our')
   })
 
+  it('name_reg for an address with no join event creates no member row (issue #14)', async () => {
+    await applyEvent(client, decodedEvent('name_reg', { name: 'phantom.our', owner: 'GPHANTOM' }))
+    const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GPHANTOM'])
+    expect(rows).toHaveLength(0)
+  })
+
   it('re-registering overwrites the previous name for the same owner', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GALICE', fee: '10' }))
     await applyEvent(client, decodedEvent('name_reg', { name: 'alice.our', owner: 'GALICE' }))
     await applyEvent(client, decodedEvent('name_reg', { name: 'alice2.our', owner: 'GALICE' }))
     const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GALICE'])
