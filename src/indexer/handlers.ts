@@ -114,8 +114,8 @@ const handlers: Record<string, Handler> = {
       [id]
     )
     await client.query(
-      `INSERT INTO loans (id, borrower, amount, outstanding, status, approved_ledger, updated_at)
-       VALUES ($1, $2, $3, $3, 'active', $4, now())
+      `INSERT INTO loans (id, borrower, amount, outstanding, total_repayment, status, approved_ledger, updated_at)
+       VALUES ($1, $2, $3, $3, COALESCE((SELECT total_repayment FROM loan_proposals WHERE id = $1), 0), 'active', $4, now())
        ON CONFLICT (id) DO UPDATE
          SET status = 'active', approved_ledger = EXCLUDED.approved_ledger, updated_at = now()`,
       [id, addr(f.borrower), str(f.amount), ev.ledger]

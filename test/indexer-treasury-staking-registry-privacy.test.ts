@@ -36,8 +36,8 @@ describe('indexer handlers: treasury', () => {
     await applyEvent(client, decodedEvent('tre_vote', { id: 2, voter: 'GV3', support: false }))
 
     const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 2')
-    expect(rows[0]?.votes_for).toBe(1)
-    expect(rows[0]?.votes_against).toBe(2)
+    expect(rows[0]?.votes_for).toBe('1')
+    expect(rows[0]?.votes_against).toBe('2')
   })
 
   it('tre_exec marks the proposal executed and notifies the destination', async () => {
@@ -64,7 +64,7 @@ describe('indexer handlers: treasury', () => {
     await applyEvent(client, decodedEvent('revealed', { proposal_id: 4, voter: 'GV1', support: true }))
 
     const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 4')
-    expect(rows[0]?.votes_for).toBe(1)
+    expect(rows[0]?.votes_for).toBe('1')
   })
 
   it('committed only notifies the voter; it does not tally a vote', async () => {
@@ -75,8 +75,8 @@ describe('indexer handlers: treasury', () => {
     await applyEvent(client, decodedEvent('committed', { proposal_id: 5, voter: 'GV1' }))
 
     const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 5')
-    expect(rows[0]?.votes_for).toBe(0)
-    expect(rows[0]?.votes_against).toBe(0)
+    expect(rows[0]?.votes_for).toBe('0')
+    expect(rows[0]?.votes_against).toBe('0')
 
     const notifs = await query<NotificationRow>('SELECT * FROM notifications WHERE address = $1', ['GV1'])
     expect(notifs).toHaveLength(1)

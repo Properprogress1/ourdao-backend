@@ -1,11 +1,30 @@
--- OurDAO backend schema. Idempotent: safe to run on every boot.
+-- OurDAO backend schema. This file is the bootstrap baseline: it always
+-- describes the *current* desired shape (CREATE ... IF NOT EXISTS), so a
+-- brand-new database gets that shape directly. It is safe to run on every
+-- boot, but on an *existing* database IF NOT EXISTS silently no-ops for any
+-- table/index whose definition changed underneath it — it cannot add a
+-- column, change a type, or otherwise alter something that already exists.
+-- Changes of that kind go in src/db/migrations/ instead and are applied,
+-- exactly once and in order, by src/db/migrate.ts. See README's "Database
+-- schema" section for the full mechanics.
+--
 -- i128 on-chain amounts are stored as NUMERIC(40,0) (i128 max ~1.7e38 < 10^39).
+
+-- Tracks which numbered migrations (src/db/migrations/NNNN_*.sql) have been
+-- applied to this database. Bootstrapped here so it exists before
+-- migrate.ts needs to read or write it.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    INTEGER PRIMARY KEY,
+  name       TEXT NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- Indexer resume state (single row, id = 1).
 CREATE TABLE IF NOT EXISTS indexer_cursor (
   id           SMALLINT PRIMARY KEY DEFAULT 1,
   paging_token TEXT,
   last_ledger  BIGINT,
+  contract_id  TEXT,
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT indexer_cursor_singleton CHECK (id = 1)
 );
@@ -45,8 +64,8 @@ CREATE TABLE IF NOT EXISTS loan_proposals (
   amount          NUMERIC(40,0) NOT NULL,
   total_repayment NUMERIC(40,0) NOT NULL DEFAULT 0,
   status          TEXT NOT NULL DEFAULT 'pending',
-  votes_for       INTEGER NOT NULL DEFAULT 0,
-  votes_against   INTEGER NOT NULL DEFAULT 0,
+  votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
+  votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
   created_ledger  BIGINT,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -61,8 +80,10 @@ CREATE TABLE IF NOT EXISTS loans (
   borrower       TEXT NOT NULL,
   amount         NUMERIC(40,0) NOT NULL,
   outstanding    NUMERIC(40,0) NOT NULL DEFAULT 0,
+  total_repayment NUMERIC(40,0) NOT NULL DEFAULT 0,
   status         TEXT NOT NULL DEFAULT 'active',
   approved_ledger BIGINT,
+  due_time       TIMESTAMPTZ,
   repaid_ledger  BIGINT,
   defaulted_ledger BIGINT,
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -76,8 +97,8 @@ CREATE TABLE IF NOT EXISTS treasury_proposals (
   destination     TEXT NOT NULL,
   private         BOOLEAN NOT NULL DEFAULT false,
   status          TEXT NOT NULL DEFAULT 'pending',
-  votes_for       INTEGER NOT NULL DEFAULT 0,
-  votes_against   INTEGER NOT NULL DEFAULT 0,
+  votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
+  votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
   created_ledger  BIGINT,
   executed_ledger BIGINT,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
