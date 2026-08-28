@@ -21,6 +21,19 @@ export interface MemberRow {
   updated_at: string
 }
 
+export interface MemberSummary {
+  member: MemberRow
+  loans: (LoanRow & { interest_charge: string; repaid_amount: string })[]
+  unread_notifications: number
+  position: {
+    contribution_share_bps: string
+    stake_share_bps: string
+    repaid_loans_count: number
+    defaulted_loans_count: number
+    defaulted_loans_value: string
+  }
+}
+
 export interface LoanProposalRow {
   id: number
   borrower: string

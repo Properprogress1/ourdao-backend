@@ -8,6 +8,7 @@ import type {
   LoanProposalRow,
   LoanRow,
   MemberRow,
+  MemberSummary,
   NotificationRow,
   TreasuryProposalRow,
   EventRow,
@@ -36,6 +37,21 @@ function cursor(v: unknown): number | null {
 
 function invalidCursor(v: unknown): boolean {
   return v !== undefined && cursor(v) === null
+}
+
+function eventCursor(v: unknown): { ledger: number, id?: string } | null {
+  if (v === undefined || v === null || v === '') return null
+  const raw = String(v).trim()
+  if (/^[0-9]+-[0-9]+$/.test(raw)) {
+    const ledger = Number(raw.split('-')[0])
+    return { ledger, id: raw }
+  }
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n > 0 ? { ledger: n } : null
+}
+
+function invalidEventCursor(v: unknown): boolean {
+  return v !== undefined && eventCursor(v) === null
 }
 
 function validAddress(address: string): boolean {
@@ -80,7 +96,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   // `joined_ledger IS NOT NULL` filters out phantom rows — an address that
   // only ever appeared in a `name_reg`/`staked` event and never actually
   // joined the DAO (issue #14). A real member always has a join ledger.
-  app.get('/members', async (req) => {
+  app.get('/members', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const l = limit((req.query as Record<string, unknown>).limit)
     return query<MemberRow>(
       `SELECT * FROM members
@@ -91,6 +108,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   })
 
   app.get<{ Params: { address: string } }>('/members/:address', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     if (!validAddress(req.params.address)) {
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
@@ -99,14 +117,77 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     return m
   })
 
+  app.get<{ Params: { address: string } }>('/members/:address/summary', async (req, reply) => {
+    reply.header('Cache-Control', 'private, no-cache')
+    if (!validAddress(req.params.address)) {
+      return reply.code(400).send({ error: 'invalid Stellar address' })
+    }
+
+    const summary = await queryOne<{ summary: MemberSummary }>(`
+      WITH m AS (
+        SELECT * FROM members WHERE address = $1
+      ),
+      totals AS (
+        SELECT 
+          (SELECT COALESCE(SUM(contribution), 0) FROM members WHERE joined_ledger IS NOT NULL) as total_contribution,
+          (SELECT COALESCE(SUM(stake), 0) FROM members WHERE exited = false) as total_stake
+      ),
+      unread_notifs AS (
+        SELECT COUNT(*) as unread_count FROM notifications WHERE address = $1 AND read = false
+      ),
+      member_loans AS (
+        SELECT COALESCE(json_agg(row_to_json(l)), '[]'::json) as loans,
+               COUNT(*) FILTER (WHERE status = 'repaid') as repaid_loans_count,
+               COUNT(*) FILTER (WHERE status = 'defaulted') as defaulted_loans_count,
+               COALESCE(SUM(outstanding) FILTER (WHERE status = 'defaulted'), 0) as defaulted_loans_value
+        FROM (
+          SELECT * FROM loans WHERE borrower = $1 ORDER BY id DESC LIMIT 100
+        ) l
+      )
+      SELECT 
+        json_build_object(
+          'member', row_to_json(m.*),
+          'loans', (SELECT loans FROM member_loans),
+          'unread_notifications', (SELECT unread_count::int FROM unread_notifs),
+          'position', json_build_object(
+            'contribution_share_bps', CASE 
+              WHEN (SELECT total_contribution FROM totals) > 0 
+              THEN ((m.contribution * 10000) / (SELECT total_contribution FROM totals))::text 
+              ELSE '0' 
+            END,
+            'stake_share_bps', CASE 
+              WHEN (SELECT total_stake FROM totals) > 0 AND m.exited = false
+              THEN ((m.stake * 10000) / (SELECT total_stake FROM totals))::text 
+              ELSE '0' 
+            END,
+            'repaid_loans_count', COALESCE((SELECT repaid_loans_count::int FROM member_loans), 0),
+            'defaulted_loans_count', COALESCE((SELECT defaulted_loans_count::int FROM member_loans), 0),
+            'defaulted_loans_value', COALESCE((SELECT defaulted_loans_value FROM member_loans), 0)::text
+          )
+        ) as summary
+      FROM m
+    `, [req.params.address])
+
+    if (!summary || !summary.summary) return reply.code(404).send({ error: 'member not found' })
+
+    const result = summary.summary
+    if (result.loans && Array.isArray(result.loans)) {
+      result.loans = result.loans.map(withLoanDerived)
+    }
+
+    return result
+  })
+
   // --- Loan proposals ---
-  app.get('/proposals/loan', async (req) => {
+  app.get('/proposals/loan', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const l = limit((req.query as Record<string, unknown>).limit)
     return query<LoanProposalRow>('SELECT * FROM loan_proposals ORDER BY id DESC LIMIT $1', [l])
   })
 
   // --- Loans (optional ?borrower= filter, ?before=<id> cursor) ---
   app.get('/loans', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
     const before = cursor(q.before)
@@ -130,6 +211,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   })
 
   app.get<{ Params: { id: string } }>('/loans/:id', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const rawId = req.params.id.trim()
     if (!/^[0-9]+$/.test(rawId) || !Number.isSafeInteger(Number(rawId)) || Number(rawId) <= 0) {
       return reply.code(400).send({ error: 'invalid loan id' })
@@ -140,13 +222,15 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   })
 
   // --- Treasury proposals ---
-  app.get('/proposals/treasury', async (req) => {
+  app.get('/proposals/treasury', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const l = limit((req.query as Record<string, unknown>).limit)
     return query<TreasuryProposalRow>('SELECT * FROM treasury_proposals ORDER BY id DESC LIMIT $1', [l])
   })
 
   // --- Notifications for an address ---
   app.get('/notifications', async (req, reply) => {
+    reply.header('Cache-Control', 'private, no-cache')
     const q = req.query as Record<string, unknown>
     if (typeof q.address !== 'string' || !q.address) {
       return reply.code(400).send({ error: 'address query param is required' })
@@ -170,12 +254,22 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   }, async (req, reply) => {
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
-    const before = cursor(q.before)
-    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    const before = eventCursor(q.before)
+    const after = eventCursor(q.after)
+    
+    if (invalidEventCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    if (invalidEventCursor(q.after)) return reply.code(400).send({ error: 'invalid after cursor' })
+    if (before !== null && after !== null) return reply.code(400).send({ error: 'cannot use before and after together' })
+    
+    const order = typeof q.order === 'string' && q.order === 'asc' ? 'ASC' : 'DESC'
+
+    if (before !== null || after !== null) {
+      reply.header('Cache-Control', 'public, max-age=31536000, immutable')
+    } else {
+      reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    }
+
     const symbol = typeof q.symbol === 'string' && q.symbol ? q.symbol : null
-    // `?contract=<C...>` scopes the raw log to one deployment (issue #16).
-    // The column is always populated; without this filter a database that
-    // has held more than one CONTRACT_ID interleaves both.
     const contract = typeof q.contract === 'string' && q.contract ? q.contract : null
 
     const conditions: string[] = []
@@ -189,15 +283,38 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       conditions.push(`contract_id = $${params.length}`)
     }
     if (before !== null) {
-      params.push(before)
-      conditions.push(`ledger < $${params.length}`)
+      if (before.id) {
+        params.push(before.ledger, before.id)
+        conditions.push(`(ledger, id) < ($${params.length - 1}, $${params.length})`)
+      } else {
+        params.push(before.ledger)
+        conditions.push(`ledger < $${params.length}`)
+      }
     }
+    if (after !== null) {
+      if (after.id) {
+        params.push(after.ledger, after.id)
+        conditions.push(`(ledger, id) > ($${params.length - 1}, $${params.length})`)
+      } else {
+        params.push(after.ledger)
+        conditions.push(`ledger > $${params.length}`)
+      }
+    }
+    
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
     params.push(l)
-    return query<EventRow>(
-      `SELECT * FROM events ${where} ORDER BY ledger DESC LIMIT $${params.length}`,
+    
+    const events = await query<EventRow>(
+      `SELECT * FROM events ${where} ORDER BY ledger ${order}, id ${order} LIMIT $${params.length}`,
       params
     )
+    
+    const response: { events: EventRow[], nextCursor?: string } = { events }
+    const lastEvent = events[events.length - 1]
+    if (lastEvent) {
+      response.nextCursor = lastEvent.id
+    }
+    return response
   })
 
   // --- Mark a single notification as read ---
@@ -256,9 +373,18 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
 
   // --- Admin/governance audit log (init, admin add/remove, threshold,
   // policy, pause/unpause) ---
-  app.get('/admin/log', async (req) => {
+  app.get('/admin/log', async (req, reply) => {
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
+    const before = cursor(q.before)
+    
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    
+    if (before !== null) {
+      reply.header('Cache-Control', 'public, max-age=31536000, immutable')
+    } else {
+      reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    }
     // `?contract=<C...>` scopes to one deployment, same as /events (issue #16).
     const contract = typeof q.contract === 'string' && q.contract ? q.contract : null
     const params: unknown[] = [ADMIN_EVENT_SYMBOLS as unknown as string[]]
@@ -285,6 +411,13 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     const l = limit(q.limit)
     const before = cursor(q.before)
     if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    
+    if (before !== null) {
+      reply.header('Cache-Control', 'public, max-age=31536000, immutable')
+    } else {
+      reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    }
+    
     const params: unknown[] = []
     let where = ''
     if (before !== null) {
@@ -312,6 +445,13 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     const l = limit(q.limit)
     const before = cursor(q.before)
     if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    
+    if (before !== null) {
+      reply.header('Cache-Control', 'public, max-age=31536000, immutable')
+    } else {
+      reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    }
+    
     const kind = q.kind
     if (kind !== 'loan' && kind !== 'treasury') {
       return reply.code(400).send({ error: 'kind query param must be "loan" or "treasury"' })
@@ -341,7 +481,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   // (without touching the append-only `events` row), and moves on. This is
   // the operator-facing view of that; `/api/stats.quarantinedEvents` is the
   // dashboard-facing count.
-  app.get('/admin/failed-events', async (req) => {
+  app.get('/admin/failed-events', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
     return query<FailedEventRow>(
