@@ -112,6 +112,42 @@ export function namedFields(symbol: string, data: unknown[]): Record<string, unk
   return fields
 }
 
+// --- Unknown-symbol observability (issue #39) --------------------------------
+//
+// An event whose symbol isn't in EVENT_FIELDS is still persisted and still
+// no-ops in the fold — that behavior is correct and unchanged. What was
+// missing is any signal that it happened: a new contract event would leave
+// derived state quietly incomplete. `warnUnknownSymbol` logs the first
+// sighting of each unknown symbol, once per process (a backlog drain or a
+// full `npm run reindex` must not emit thousands of identical lines).
+
+const seenUnknownSymbols = new Set<string>()
+
+/** Log a one-time warning for an event symbol missing from the catalog.
+ *  Called from the fold (indexer/handlers.ts `applyEvent`), so it fires on
+ *  the live path and on a rebuild alike. */
+export function warnUnknownSymbol(ev: { symbol: string; ledger: number; id: string }): void {
+  if (seenUnknownSymbols.has(ev.symbol)) return
+  seenUnknownSymbols.add(ev.symbol)
+  console.warn(
+    `[events] unknown event symbol "${ev.symbol}" — not in the EVENT_FIELDS catalog ` +
+      `(first seen at ledger ${ev.ledger}, event ${ev.id}). The raw event is stored ` +
+      `but no derived table was updated. Add its topic-symbol → data-tuple mapping ` +
+      `to src/stellar/events.ts.`
+  )
+}
+
+/** Test-only: forget which unknown symbols have already been warned about, so
+ *  each test starts from a clean slate. */
+export function resetUnknownSymbolWarningsForTest(): void {
+  seenUnknownSymbols.clear()
+}
+
+/** Whether a symbol is present in the event catalog. */
+export function isKnownSymbol(symbol: string): symbol is EventSymbol {
+  return Object.prototype.hasOwnProperty.call(EVENT_FIELDS, symbol)
+}
+
 /** Decode one getEvents response entry into a JSON-safe DecodedEvent. */
 export function decodeEvent(ev: rpc.Api.EventResponse): DecodedEvent {
   const topics = (ev.topic ?? []).map(safeNative)
