@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg'
 import type { DecodedEvent } from '../stellar/events.js'
+import { notifyStreamClients, STREAM_CHANNELS } from '../api/stream.js'
 import type { NotificationType } from '../types.js'
 
 // Helpers ------------------------------------------------------------------
@@ -521,4 +522,39 @@ const handlers: Record<string, Handler> = {
 export async function applyEvent(client: PoolClient, ev: DecodedEvent): Promise<void> {
   const handler = handlers[ev.symbol]
   if (handler) await handler(client, ev)
+
+  // Emit NOTIFY for stream subscribers (issue #63)
+  // Map event symbols to stream channels
+  const channelMap: Record<string, string> = {
+    joined: STREAM_CHANNELS.members,
+    exited: STREAM_CHANNELS.members,
+    staked: STREAM_CHANNELS.members,
+    unstaked: STREAM_CHANNELS.members,
+    claimed: STREAM_CHANNELS.members,
+    
+    loan_req: STREAM_CHANNELS.loan_proposals,
+    loan_edit: STREAM_CHANNELS.loan_proposals,
+    loan_vote: STREAM_CHANNELS.loan_proposals,
+    loan_appr: STREAM_CHANNELS.loan_proposals,
+    loan_reject: STREAM_CHANNELS.loan_proposals,
+    loan_disburse: STREAM_CHANNELS.loans,
+    loan_repay: STREAM_CHANNELS.loans,
+    loan_default: STREAM_CHANNELS.loans,
+    
+    treasury_req: STREAM_CHANNELS.treasury_proposals,
+    treasury_vote: STREAM_CHANNELS.treasury_proposals,
+    treasury_appr: STREAM_CHANNELS.treasury_proposals,
+    treasury_reject: STREAM_CHANNELS.treasury_proposals,
+    
+    interest: STREAM_CHANNELS.interest,
+  }
+
+  const channel = channelMap[ev.symbol]
+  if (channel) {
+    await notifyStreamClients(client, channel as any, {
+      symbol: ev.symbol,
+      ledger: ev.ledger,
+      timestamp: Date.now(),
+    })
+  }
 }
