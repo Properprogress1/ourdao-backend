@@ -8,6 +8,7 @@ import { MemoryNonceStore } from '../auth.js'
 
 interface CursorRow {
   last_ledger: number | null
+  observed_tip_ledger: number | null
   updated_at: string | null
 }
 
@@ -55,7 +56,9 @@ export async function buildServer(): Promise<FastifyInstance> {
     // 2. Indexer cursor state
     let row: CursorRow | null = null
     try {
-      row = await pool.query<CursorRow>('SELECT last_ledger, updated_at FROM indexer_cursor WHERE id = 1').then((r) => r.rows[0] ?? null)
+      row = await pool
+        .query<CursorRow>('SELECT last_ledger, observed_tip_ledger, updated_at FROM indexer_cursor WHERE id = 1')
+        .then((r) => r.rows[0] ?? null)
     } catch {
       // Table may not exist yet — treat as cold start
     }
@@ -65,6 +68,7 @@ export async function buildServer(): Promise<FastifyInstance> {
         status: 'ready',
         indexer: 'cold_start',
         lastIndexedLedger: null,
+        observedTipLedger: row?.observed_tip_ledger ?? null,
         secondsSinceUpdate: null,
       })
     }
@@ -78,6 +82,7 @@ export async function buildServer(): Promise<FastifyInstance> {
         status: 'not ready',
         reason: 'indexer_stale',
         lastIndexedLedger: row.last_ledger,
+        observedTipLedger: row.observed_tip_ledger,
         secondsSinceUpdate,
         staleAfterMs: config.indexer.staleAfterMs,
       })
@@ -87,6 +92,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       status: 'ready',
       indexer: 'ok',
       lastIndexedLedger: row.last_ledger,
+      observedTipLedger: row.observed_tip_ledger,
       secondsSinceUpdate,
     })
   })

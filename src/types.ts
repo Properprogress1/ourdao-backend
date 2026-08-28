@@ -99,6 +99,27 @@ export interface InterestDistributionRow {
   created_at: string
 }
 
+export type ProposalKind = 'loan' | 'treasury'
+
+export interface DocumentRow {
+  id: number
+  proposal_id: number
+  kind: ProposalKind
+  caller: string
+  ledger: number
+  tx_hash: string | null
+  attached_at: string
+}
+
+export interface FailedEventRow {
+  id: number
+  event_id: string
+  symbol: string
+  ledger: number
+  error: string
+  created_at: string
+}
+
 export interface DAOStats {
   totalMembers: number
   activeMembers: number
@@ -117,7 +138,15 @@ export interface DAOStats {
   principalLent: string
   principalRepaid: string
   valueDefaulted: string
+  // Quarantined-event count (issue #43) — a handler that deterministically
+  // throws no longer wedges the indexer forever; this is the "we quarantined
+  // N events" signal a dashboard needs so that isn't invisible.
+  quarantinedEvents: number
+  // `lastIndexedLedger` is the highest ledger actually folded; `observedTipLedger`
+  // is the RPC's most recently observed chain tip (issue #45) — "folded to X,
+  // chain is at Y" is the useful pair for gauging indexer lag.
   lastIndexedLedger: number | null
+  observedTipLedger: number | null
   secondsSinceUpdate: number | null
   indexerStale: boolean
 }

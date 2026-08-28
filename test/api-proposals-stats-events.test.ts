@@ -53,6 +53,10 @@ describe('API: proposals, stats, events, admin/log', () => {
       `UPDATE dao_totals SET interest_collected = 4200, principal_lent = 9000,
               principal_repaid = 3000, value_defaulted = 88 WHERE id = 1`
     )
+    await query(`UPDATE indexer_cursor SET observed_tip_ledger = 1200 WHERE id = 1`)
+    await query(
+      `INSERT INTO failed_events (event_id, symbol, ledger, error) VALUES ('999-0', 'loan_dflt', 999, 'boom')`
+    )
 
     const res = await app.inject({ method: 'GET', url: '/api/stats' })
     const body = res.json()
@@ -70,6 +74,11 @@ describe('API: proposals, stats, events, admin/log', () => {
     // Only GA's stake — GB exited, so their stale 50 is excluded.
     expect(body.totalStaked).toBe('100')
     expect(body.lastIndexedLedger).toBe(999)
+    // Issue #45: the folded high-water mark and the RPC-observed tip are
+    // reported separately rather than conflated into one column.
+    expect(body.observedTipLedger).toBe(1200)
+    // Issue #43: a dashboard-visible count of quarantined events.
+    expect(body.quarantinedEvents).toBe(1)
     // Lifetime money figures (issue #24), decimal strings.
     expect(body.interestCollected).toBe('4200')
     expect(body.principalLent).toBe('9000')

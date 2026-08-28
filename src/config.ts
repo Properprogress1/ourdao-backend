@@ -76,6 +76,11 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     maxDrainMs: int(env, 'DRAIN_MAX_MS', 30_000),
     // How long (ms) the indexer cursor can be idle before /ready reports stale.
     staleAfterMs: int(env, 'INDEXER_STALE_AFTER_MS', 120_000),
+    // After this many consecutive whole-page failures with the same error on
+    // the same page, the poller treats the failure as deterministic rather
+    // than transient and quarantines the offending event(s) instead of
+    // retrying forever (issue #43).
+    quarantineAfterFailures: int(env, 'INDEXER_QUARANTINE_AFTER_FAILURES', 3),
     // When CONTRACT_ID no longer matches the contract the saved cursor was
     // last advanced for (a redeploy — the contract has no upgrade path), the
     // indexer refuses to start so two deployments' state can't merge (issue

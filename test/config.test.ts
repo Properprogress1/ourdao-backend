@@ -63,6 +63,7 @@ describe('resolveConfig', () => {
         maxDrainPages: 20,
         maxDrainMs: 30000,
         staleAfterMs: 120000,
+        quarantineAfterFailures: 3,
         resetOnContractChange: false,
       },
     })
