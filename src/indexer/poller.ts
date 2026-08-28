@@ -1,14 +1,18 @@
 import type { rpc } from '@stellar/stellar-sdk'
+import type { PoolClient } from 'pg'
 import { config, assertContractConfigured } from '../config.js'
 import { pool, queryOne } from '../db/index.js'
 import { server, getLatestLedger, getLatestLedgerInfo } from '../stellar/rpc.js'
-import { decodeEvent } from '../stellar/events.js'
+import { decodeEvent, type DecodedEvent } from '../stellar/events.js'
 import { applyEvent } from './handlers.js'
 
 interface CursorRow {
   paging_token: string | null
   last_ledger: number | null
   last_ledger_hash: string | null
+  // RPC-observed chain tip, distinct from `last_ledger` (issue #45) — see
+  // the comment on the `documents`/schema migration and fetchOnce below.
+  observed_tip_ledger: number | null
   contract_id: string | null
 }
 
@@ -95,7 +99,7 @@ export async function ensureCursorContract(contractId: string): Promise<void> {
  *  resuming with another contract's paging_token. */
 async function loadCursor(contractId: string): Promise<CursorRow | null> {
   const row = await queryOne<CursorRow>(
-    'SELECT paging_token, last_ledger, last_ledger_hash, contract_id FROM indexer_cursor WHERE id = 1'
+    'SELECT paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id FROM indexer_cursor WHERE id = 1'
   )
   if (row && row.contract_id != null && row.contract_id !== contractId) return null
   return row
@@ -105,13 +109,14 @@ async function saveCursor(
   contractId: string,
   pagingToken: string | null,
   lastLedger: number,
+  observedTipLedger: number,
   lastLedgerHash: string | null
 ): Promise<void> {
   await pool.query(
-    `INSERT INTO indexer_cursor (id, paging_token, last_ledger, last_ledger_hash, contract_id, updated_at)
-     VALUES (1, $1, $2, $3, $4, now())
-     ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, contract_id = $4, updated_at = now()`,
-    [pagingToken, lastLedger, lastLedgerHash, contractId]
+    `INSERT INTO indexer_cursor (id, paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id, updated_at)
+     VALUES (1, $1, $2, $3, $4, $5, now())
+     ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, observed_tip_ledger = $4, contract_id = $5, updated_at = now()`,
+    [pagingToken, lastLedger, lastLedgerHash, observedTipLedger, contractId]
   )
 }
 
@@ -127,9 +132,27 @@ async function resolveStartLedger(): Promise<number> {
   return Math.max(1, latest - config.indexer.startLookbackLedgers)
 }
 
+/** Insert one event's raw log row (idempotent on its unique id). Returns
+ *  whether this call actually inserted it (`false` means already logged by
+ *  an earlier attempt). Shared by the whole-page path and the per-event
+ *  quarantine path (issue #43) so both write the same row the same way. */
+async function insertRawEvent(client: PoolClient, ev: DecodedEvent): Promise<boolean> {
+  const ins = await client.query(
+    `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (id) DO NOTHING`,
+    [ev.id, ev.ledger, ev.closedAt, ev.contractId, ev.symbol, JSON.stringify(ev.topics), JSON.stringify(ev.data), ev.txHash]
+  )
+  return ins.rowCount === 1
+}
+
 /** Persist a page of events + their derived side effects atomically.
  *  `lastLedger` is the highest ledger already folded — used for the
- *  continuity check (issue #23). */
+ *  continuity check (issue #23). Whole-page-transaction is the fast path:
+ *  it's what runs on every normal poll. When a page can't be folded this way
+ *  — one event's handler throws deterministically — the caller
+ *  (`ingestPageWithQuarantine`) falls back to folding one event per
+ *  transaction so the rest of the page isn't held hostage (issue #43). */
 async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): Promise<void> {
   if (events.length === 0) return
   const client = await pool.connect()
@@ -147,17 +170,12 @@ async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): 
         )
       }
       // Raw log first (idempotent on the unique event id), then derived state.
-      const ins = await client.query(
-        `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (id) DO NOTHING`,
-        [ev.id, ev.ledger, ev.closedAt, ev.contractId, ev.symbol, JSON.stringify(ev.topics), JSON.stringify(ev.data), ev.txHash]
-      )
+      const isNew = await insertRawEvent(client, ev)
       // Fold only on first sight of an event id. A re-delivered page then
       // can't re-apply increments (issue #24, and the vote-tally hazard) —
-      // raw insert and fold are in one transaction, so rowCount === 1 means
+      // raw insert and fold are in one transaction, so isNew means
       // "not yet folded".
-      if (ins.rowCount === 1) {
+      if (isNew) {
         await applyEvent(client, ev)
       }
     }
@@ -167,6 +185,113 @@ async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): 
     throw err
   } finally {
     client.release()
+  }
+}
+
+async function recordQuarantinedEvent(ev: DecodedEvent, error: unknown): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error)
+  await pool.query(
+    `INSERT INTO failed_events (event_id, symbol, ledger, error) VALUES ($1, $2, $3, $4)`,
+    [ev.id, ev.symbol, ev.ledger, message]
+  )
+  console.error(`[indexer] quarantined event ${ev.id} (${ev.symbol}) at ledger ${ev.ledger}: ${message}`)
+}
+
+/** Fold exactly one event, each side in its own transaction (issue #43):
+ *  the raw log insert commits on its own, so it survives untouched even if
+ *  folding fails below — the append-only `events` row is never rolled back
+ *  along with a broken fold. If applying the event throws, that one
+ *  transaction rolls back (no partial derived-table writes) and the event is
+ *  recorded in `failed_events` instead — the rest of the page's events are
+ *  unaffected, and the cursor still advances past this one. A ReorgDetectedError
+ *  is never caught here; it propagates so the indexer still halts on a
+ *  genuine rewind. */
+async function ingestEventQuarantined(ev: DecodedEvent, lastLedger: number): Promise<void> {
+  if (typeof ev.ledger === 'number' && lastLedger > 0 && ev.ledger < lastLedger) {
+    throw new ReorgDetectedError(
+      `event ${ev.id} is from ledger ${ev.ledger}, below the last folded ledger ${lastLedger}`
+    )
+  }
+
+  const rawClient = await pool.connect()
+  let isNew: boolean
+  try {
+    isNew = await insertRawEvent(rawClient, ev)
+  } finally {
+    rawClient.release()
+  }
+  if (!isNew) return // already folded by an earlier attempt at this page
+
+  const foldClient = await pool.connect()
+  try {
+    await foldClient.query('BEGIN')
+    await applyEvent(foldClient, ev)
+    await foldClient.query('COMMIT')
+  } catch (err) {
+    await foldClient.query('ROLLBACK')
+    await recordQuarantinedEvent(ev, err)
+  } finally {
+    foldClient.release()
+  }
+}
+
+interface QuarantineState {
+  pageKey: string
+  errorMessage: string
+  failures: number
+}
+
+// Tracks consecutive whole-page failures across poll iterations so a
+// transient error (RPC hiccup, DB restart — expected to clear on retry) is
+// told apart from a deterministic one (issue #43). Single indexer instance
+// per README, so in-memory state here is fine — it doesn't need to survive a
+// restart, and a restart just starts the same count over at the same page.
+let quarantineState: QuarantineState | null = null
+
+function pageKeyFor(events: rpc.Api.EventResponse[]): string {
+  if (events.length === 0) return ''
+  return `${events[0]!.id}..${events[events.length - 1]!.id}:${events.length}`
+}
+
+/** Wraps `ingestPage`'s whole-page-transaction fast path with the quarantine
+ *  fallback (issue #43). A `ReorgDetectedError` always propagates immediately
+ *  — never quarantined, on either path. Any other error is compared against
+ *  the previous failure on the same page: once the *same* error has recurred
+ *  `INDEXER_QUARANTINE_AFTER_FAILURES` times running on what
+ *  `server.getEvents` deterministically returns for the same unmoved cursor
+ *  (i.e. the same page), it's treated as deterministic and the page is
+ *  retried one event per transaction so the rest of it can still fold. */
+async function ingestPageWithQuarantine(events: rpc.Api.EventResponse[], lastLedger: number): Promise<void> {
+  try {
+    await ingestPage(events, lastLedger)
+    quarantineState = null
+    return
+  } catch (err) {
+    if (err instanceof ReorgDetectedError) throw err
+
+    const pageKey = pageKeyFor(events)
+    const errorMessage = err instanceof Error ? err.message : String(err)
+    if (quarantineState && quarantineState.pageKey === pageKey && quarantineState.errorMessage === errorMessage) {
+      quarantineState.failures += 1
+    } else {
+      quarantineState = { pageKey, errorMessage, failures: 1 }
+    }
+
+    if (quarantineState.failures < config.indexer.quarantineAfterFailures) {
+      // Might still be transient — let runIndexer's normal backoff-and-retry
+      // give it another chance before concluding it's deterministic.
+      throw err
+    }
+
+    console.error(
+      `[indexer] page failed ${quarantineState.failures} consecutive times with the same error — ` +
+        `switching to per-event quarantine mode. ${errorMessage}`
+    )
+    for (const raw of events) {
+      const ev = decodeEvent(raw)
+      await ingestEventQuarantined(ev, lastLedger)
+    }
+    quarantineState = null
   }
 }
 
@@ -204,28 +329,40 @@ export async function fetchOnce(contractId: string): Promise<void> {
   const drainStart = Date.now()
   let totalEvents = 0
   let lastLedger = cursor?.last_ledger ?? 0
+  let observedTipLedger = cursor?.observed_tip_ledger ?? tip.sequence
+  let cursorWritten = false
 
   for (;;) {
     const res = await server.getEvents(currentRequest)
     const events = res.events ?? []
     const pageCount = events.length
 
-    await ingestPage(events, lastLedger)
+    await ingestPageWithQuarantine(events, lastLedger)
     totalPages += 1
     totalEvents += pageCount
 
     // Advance cursor after every page (issue #3: per-page cursor advancement).
     const last = events[events.length - 1]
     const nextToken = last?.id ?? res.cursor ?? currentRequest.cursor ?? null
-    const pageLedger = last?.ledger ?? res.latestLedger ?? lastLedger
-    if (nextToken !== cursor?.paging_token || pageLedger !== lastLedger) {
-      await saveCursor(contractId, nextToken, pageLedger, tip.hash)
-      lastLedger = pageLedger
+    // Highest ledger actually folded (issue #45): only advances when this
+    // page had events. An empty page must never fall through to the RPC tip
+    // here — that conflated "folded to" with "chain is at", and a single
+    // empty page during catch-up could jump this past ledgers a later, real
+    // page would legitimately arrive at, tripping a false ReorgDetectedError.
+    const foldedLedger = last?.ledger ?? lastLedger
+    // RPC-observed chain tip, tracked separately — freshness reporting only,
+    // never fed into the continuity check above or in ingestPage.
+    const newObservedTip = res.latestLedger ?? observedTipLedger
+    if (nextToken !== cursor?.paging_token || foldedLedger !== lastLedger || newObservedTip !== observedTipLedger) {
+      await saveCursor(contractId, nextToken, foldedLedger, newObservedTip, tip.hash)
+      lastLedger = foldedLedger
+      observedTipLedger = newObservedTip
+      cursorWritten = true
     }
 
     // Log catch-up progress distinctly from steady-state (issue #3).
     if (pageCount > 0) {
-      console.log(`[indexer] page ${totalPages}: ingested ${pageCount} event(s) up to ledger ${pageLedger}`)
+      console.log(`[indexer] page ${totalPages}: ingested ${pageCount} event(s) up to ledger ${foldedLedger}`)
     }
 
     // Stop draining if:
@@ -247,9 +384,10 @@ export async function fetchOnce(contractId: string): Promise<void> {
     currentRequest = { ...base, cursor: res.cursor }
   }
 
-  // On a genuinely idle contract with no new events, touch updated_at so
-  // /ready doesn't falsely report stale (issue #2 context note).
-  if (totalEvents === 0) {
+  // On a genuinely idle contract with nothing new to report (no events, and
+  // the observed tip/cursor didn't move either), touch updated_at so /ready
+  // doesn't falsely report stale (issue #2 context note).
+  if (totalEvents === 0 && !cursorWritten) {
     await touchCursor()
   } else if (totalPages > 1) {
     console.log(`[indexer] drain complete: ${totalPages} pages, ${totalEvents} events in ${Date.now() - drainStart}ms`)

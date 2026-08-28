@@ -3,6 +3,16 @@ import type { DecodedEvent } from '../stellar/events.js'
 import type { NotificationType } from '../types.js'
 
 // Helpers ------------------------------------------------------------------
+//
+// `str`/`num`/`addr` below coerce a missing/malformed field into a plausible
+// default ('0', null, ''). That's the right call for a genuinely optional
+// field (weight, due_time, tx_hash) — but used on a field a derived row
+// depends on, it turns "this event didn't decode" into "silently write a
+// zero-amount row" or "UPDATE ... WHERE id = NULL", which commits and looks
+// like legitimate data (issue #42). `requireAddr`/`requireId`/`requireAmount`/
+// `requireBool` below are for exactly those required fields: they throw
+// instead of coercing, so the transaction (whole-page or, once quarantined,
+// single-event — see poller.ts) rolls back rather than writing a wrong row.
 
 const str = (v: unknown): string => (v == null ? '0' : String(v))
 const num = (v: unknown): number | null => {
@@ -10,6 +20,77 @@ const num = (v: unknown): number | null => {
   return Number.isFinite(n) ? n : null
 }
 const addr = (v: unknown): string => (typeof v === 'string' ? v : String(v ?? ''))
+
+/** Thrown by a handler when a field it needs to write a derived row failed to
+ *  decode. Distinguishes "this event is malformed" from a transient DB/RPC
+ *  error — see poller.ts's quarantine path, which is where this ultimately
+ *  gets logged (with this event's id/symbol) and recorded. */
+export class FieldValidationError extends Error {
+  constructor(ev: DecodedEvent, field: string, reason: string) {
+    super(`event ${ev.id} (${ev.symbol}): field "${field}" ${reason}`)
+    this.name = 'FieldValidationError'
+  }
+}
+
+function requireAddr(ev: DecodedEvent, field: string): string {
+  const v = ev.fields[field]
+  if (typeof v !== 'string' || v === '') {
+    throw new FieldValidationError(ev, field, `must be a non-empty address string, got ${JSON.stringify(v)}`)
+  }
+  return v
+}
+
+function requireId(ev: DecodedEvent, field: string): number {
+  const v = ev.fields[field]
+  const n = Number(v)
+  if (v == null || !Number.isFinite(n) || !Number.isInteger(n)) {
+    throw new FieldValidationError(ev, field, `must be a finite integer id, got ${JSON.stringify(v)}`)
+  }
+  return n
+}
+
+/** i128 amounts arrive as decimal-integer strings (bigints are stringified
+ *  upstream in toJsonSafe) or, for small values, as a JS number. Never
+ *  negative — every amount field here is a magnitude, not a signed delta. */
+function requireAmount(ev: DecodedEvent, field: string): string {
+  const v = ev.fields[field]
+  const s = typeof v === 'number' && Number.isFinite(v) ? String(v) : v
+  if (typeof s !== 'string' || !/^\d+$/.test(s)) {
+    throw new FieldValidationError(ev, field, `must be a non-negative decimal-integer amount, got ${JSON.stringify(v)}`)
+  }
+  return s
+}
+
+function requireBool(ev: DecodedEvent, field: string): boolean {
+  const v = ev.fields[field]
+  if (typeof v !== 'boolean') {
+    throw new FieldValidationError(ev, field, `must be a boolean, got ${JSON.stringify(v)}`)
+  }
+  return v
+}
+
+// ourdao-contracts' ProposalKind (contracts/dao/src/storage.rs) is a
+// fieldless enum — `Loan` or `Treasury`, no associated data. soroban-sdk's
+// #[contracttype] derive encodes that as a Symbol carrying the variant name;
+// depending on stellar-sdk version, scValToNative surfaces it as the bare
+// string, a single-element array, or a `{ tag, values }` object. Handle all
+// three rather than guessing one.
+function normalizeProposalKind(v: unknown): 'loan' | 'treasury' | null {
+  let tag: unknown = v
+  if (Array.isArray(v)) tag = v[0]
+  else if (v && typeof v === 'object' && 'tag' in v) tag = (v as { tag: unknown }).tag
+  if (typeof tag !== 'string') return null
+  const lower = tag.toLowerCase()
+  return lower === 'loan' || lower === 'treasury' ? lower : null
+}
+
+function requireProposalKind(ev: DecodedEvent, field: string): 'loan' | 'treasury' {
+  const kind = normalizeProposalKind(ev.fields[field])
+  if (kind === null) {
+    throw new FieldValidationError(ev, field, `must be a ProposalKind ("Loan"/"Treasury"), got ${JSON.stringify(ev.fields[field])}`)
+  }
+  return kind
+}
 
 async function notify(
   client: PoolClient,
@@ -48,8 +129,8 @@ type Handler = (client: PoolClient, ev: DecodedEvent) => Promise<void>
 
 const handlers: Record<string, Handler> = {
   async joined(client, ev) {
-    const f = ev.fields
-    const member = addr(f.member)
+    const member = requireAddr(ev, 'member')
+    const fee = requireAmount(ev, 'fee')
     // membership.rs::register_member stores a brand-new Member record on
     // every join, including a rejoin after exit — contribution is *set* to
     // the fee, never added to what was there before, and every other bit of
@@ -66,14 +147,14 @@ const handlers: Record<string, Handler> = {
              exited_ledger   = NULL,
              has_active_loan = false,
              updated_at      = now()`,
-      [member, ev.ledger, str(f.fee)]
+      [member, ev.ledger, fee]
     )
     await notify(client, ev, member, 'success', 'Welcome to OurDAO', 'Your membership is active.')
   },
 
   async exited(client, ev) {
-    const f = ev.fields
-    const member = addr(f.member)
+    const member = requireAddr(ev, 'member')
+    const share = requireAmount(ev, 'share')
     // Mirror the contract's exit_dao (issue #13): it zeroes the member's
     // stake (and decrements total_staked), and exit requires no active loan,
     // so the indexer row must reflect both. `pending_claimed` is left as-is
@@ -86,25 +167,28 @@ const handlers: Record<string, Handler> = {
          SET exited = true, exit_share = $2, exited_ledger = $3,
              stake = 0, has_active_loan = false, updated_at = now()
        WHERE address = $1`,
-      [member, str(f.share), ev.ledger]
+      [member, share, ev.ledger]
     )
-    await notify(client, ev, member, 'info', 'Membership ended', `You withdrew your share of ${str(f.share)}.`)
+    await notify(client, ev, member, 'info', 'Membership ended', `You withdrew your share of ${share}.`)
   },
 
   async claimed(client, ev) {
-    const f = ev.fields
-    const member = addr(f.member)
+    const member = requireAddr(ev, 'member')
+    const pending = requireAmount(ev, 'pending')
     await client.query(
       `UPDATE members
          SET pending_claimed = pending_claimed + $2, updated_at = now()
        WHERE address = $1`,
-      [member, str(f.pending)]
+      [member, pending]
     )
-    await notify(client, ev, member, 'success', 'Yield claimed', `You claimed ${str(f.pending)} in rewards.`)
+    await notify(client, ev, member, 'success', 'Yield claimed', `You claimed ${pending} in rewards.`)
   },
 
   async loan_req(client, ev) {
-    const f = ev.fields
+    const id = requireId(ev, 'id')
+    const borrower = requireAddr(ev, 'borrower')
+    const amount = requireAmount(ev, 'amount')
+    const totalRepayment = requireAmount(ev, 'total_repayment')
     await client.query(
       `INSERT INTO loan_proposals (id, borrower, amount, total_repayment, status, created_ledger, updated_at)
        VALUES ($1, $2, $3, $4, 'pending', $5, now())
@@ -112,35 +196,41 @@ const handlers: Record<string, Handler> = {
          SET amount = EXCLUDED.amount,
              total_repayment = EXCLUDED.total_repayment,
              updated_at = now()`,
-      [num(f.id), addr(f.borrower), str(f.amount), str(f.total_repayment), ev.ledger]
+      [id, borrower, amount, totalRepayment, ev.ledger]
     )
-    await notify(client, ev, addr(f.borrower), 'info', 'Loan requested', `Proposal #${str(f.id)} is open for voting.`)
+    await notify(client, ev, borrower, 'info', 'Loan requested', `Proposal #${id} is open for voting.`)
   },
 
   async loan_edit(client, ev) {
-    const f = ev.fields
+    const proposalId = requireId(ev, 'proposal_id')
+    const newAmount = requireAmount(ev, 'new_amount')
+    const totalRepayment = requireAmount(ev, 'total_repayment')
     await client.query(
       `UPDATE loan_proposals
          SET amount = $2, total_repayment = $3, updated_at = now()
        WHERE id = $1`,
-      [num(f.proposal_id), str(f.new_amount), str(f.total_repayment)]
+      [proposalId, newAmount, totalRepayment]
     )
   },
 
   async loan_vote(client, ev) {
+    const proposalId = requireId(ev, 'proposal_id')
+    const support = requireBool(ev, 'support')
     const f = ev.fields
-    const column = f.support === true ? 'votes_for' : 'votes_against'
+    const column = support ? 'votes_for' : 'votes_against'
     await client.query(
       `UPDATE loan_proposals
          SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
        WHERE id = $1`,
-      [num(f.proposal_id), weightOf(f)]
+      [proposalId, weightOf(f)]
     )
   },
 
   async loan_appr(client, ev) {
     const f = ev.fields
-    const id = num(f.id)
+    const id = requireId(ev, 'id')
+    const borrower = requireAddr(ev, 'borrower')
+    const amount = requireAmount(ev, 'amount')
     await client.query(
       `UPDATE loan_proposals SET status = 'approved', updated_at = now() WHERE id = $1`,
       [id]
@@ -157,10 +247,11 @@ const handlers: Record<string, Handler> = {
       `SELECT total_repayment FROM loan_proposals WHERE id = $1`,
       [id]
     )
-    const totalRepayment = proposal.rows[0]?.total_repayment ?? str(f.amount)
+    const totalRepayment = proposal.rows[0]?.total_repayment ?? amount
     // due_time is a unix-seconds timestamp on the contract side; convert for
     // the TIMESTAMPTZ column. Always null today since the event doesn't
-    // carry it yet (see the comment on EVENT_FIELDS.loan_appr).
+    // carry it yet (see the comment on EVENT_FIELDS.loan_appr) — genuinely
+    // optional, so it keeps the coercion-friendly reading.
     const dueTime = f.due_time == null ? null : new Date(Number(f.due_time) * 1000)
     const loanIns = await client.query<{ is_new: boolean }>(
       `INSERT INTO loans (id, borrower, amount, total_repayment, outstanding, status, approved_ledger, due_time, updated_at)
@@ -168,7 +259,7 @@ const handlers: Record<string, Handler> = {
        ON CONFLICT (id) DO UPDATE
          SET status = 'active', approved_ledger = EXCLUDED.approved_ledger, updated_at = now()
        RETURNING (xmax = 0) AS is_new`,
-      [id, addr(f.borrower), str(f.amount), totalRepayment, ev.ledger, dueTime]
+      [id, borrower, amount, totalRepayment, ev.ledger, dueTime]
     )
     // Fold principal lent once per loan (issue #24). `xmax = 0` is true only
     // when this was a fresh INSERT, not the ON CONFLICT UPDATE branch — so a
@@ -176,19 +267,20 @@ const handlers: Record<string, Handler> = {
     if (loanIns.rows[0]?.is_new) {
       await client.query(
         `UPDATE dao_totals SET principal_lent = principal_lent + $1, updated_at = now() WHERE id = 1`,
-        [str(f.amount)]
+        [amount]
       )
     }
     await client.query(
       `UPDATE members SET has_active_loan = true WHERE address = $1`,
-      [addr(f.borrower)]
+      [borrower]
     )
-    await notify(client, ev, addr(f.borrower), 'success', 'Loan approved', `Loan #${str(id)} of ${str(f.amount)} was approved.`)
+    await notify(client, ev, borrower, 'success', 'Loan approved', `Loan #${id} of ${amount} was approved.`)
   },
 
   async loan_rpy(client, ev) {
-    const f = ev.fields
-    const outstanding = str(f.outstanding)
+    const loanId = requireId(ev, 'loan_id')
+    const borrower = requireAddr(ev, 'borrower')
+    const outstanding = requireAmount(ev, 'outstanding')
     const status = outstanding === '0' ? 'repaid' : 'active'
     // `FROM loans AS prev` captures the pre-update row so we can tell whether
     // this repayment is the one that clears the loan (issue #24: fold the
@@ -202,7 +294,7 @@ const handlers: Record<string, Handler> = {
        FROM loans AS prev
        WHERE l.id = $1 AND prev.id = $1
        RETURNING l.amount::text AS amount, (prev.status = 'repaid') AS was_repaid`,
-      [num(f.loan_id), outstanding, status, ev.ledger]
+      [loanId, outstanding, status, ev.ledger]
     )
     const loan = upd.rows[0]
     if (status === 'repaid' && loan && !loan.was_repaid) {
@@ -212,17 +304,17 @@ const handlers: Record<string, Handler> = {
       )
     }
     if (status === 'repaid') {
-      await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [addr(f.borrower)])
+      await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [borrower])
     }
     const type: NotificationType = status === 'repaid' ? 'success' : 'info'
-    const msg = status === 'repaid' ? `Loan #${str(f.loan_id)} is fully repaid.` : `Repayment received; ${outstanding} remaining.`
-    await notify(client, ev, addr(f.borrower), type, 'Loan repayment', msg)
+    const msg = status === 'repaid' ? `Loan #${loanId} is fully repaid.` : `Repayment received; ${outstanding} remaining.`
+    await notify(client, ev, borrower, type, 'Loan repayment', msg)
   },
 
   async loan_dflt(client, ev) {
-    const f = ev.fields
-    const id = num(f.loan_id)
-    const borrower = addr(f.borrower)
+    const id = requireId(ev, 'loan_id')
+    const borrower = requireAddr(ev, 'borrower')
+    const penalty = requireAmount(ev, 'penalty')
     // Guard on the loan's own status rather than trusting the poll loop
     // never redelivers a page (it can — see the event re-delivery issue in
     // this repo). `loans.rs::mark_loan_defaulted` only ever transitions a
@@ -252,7 +344,7 @@ const handlers: Record<string, Handler> = {
              defaults_count  = defaults_count + 1,
              updated_at      = now()
        WHERE address = $1`,
-      [borrower, str(f.penalty)]
+      [borrower, penalty]
     )
     await notify(
       client,
@@ -260,7 +352,7 @@ const handlers: Record<string, Handler> = {
       borrower,
       'error',
       'Loan defaulted',
-      `Loan #${str(id)} was marked defaulted; a penalty of ${str(f.penalty)} was applied to your contribution.`
+      `Loan #${id} was marked defaulted; a penalty of ${penalty} was applied to your contribution.`
     )
   },
 
@@ -273,13 +365,14 @@ const handlers: Record<string, Handler> = {
     // `f.interest` is interest *collected*: distribute_interest divides it by
     // active members and the indivisible remainder stays in the treasury, so
     // this is slightly more than what members were credited. `f.active` is the
-    // active-member count at this distribution, kept so per-member share is
-    // derivable historically.
+    // active-member count at this distribution — genuinely optional (a nullable
+    // column, no row depends on it), kept so per-member share is derivable
+    // historically when present.
     //
     // Idempotent on the raw event id: a re-delivered `interest` event does not
     // double-count (ON CONFLICT DO NOTHING + the rowCount guard).
     const f = ev.fields
-    const amount = str(f.interest)
+    const amount = requireAmount(ev, 'interest')
     const inserted = await client.query(
       `INSERT INTO interest_distributions (event_id, ledger, amount, active_members, tx_hash)
        VALUES ($1, $2, $3, $4, $5)
@@ -298,36 +391,43 @@ const handlers: Record<string, Handler> = {
 
   async tre_prop(client, ev) {
     const f = ev.fields
+    const id = requireId(ev, 'id')
+    const amount = requireAmount(ev, 'amount')
+    const destination = requireAddr(ev, 'destination')
     await client.query(
       `INSERT INTO treasury_proposals (id, amount, destination, private, status, created_ledger, updated_at)
        VALUES ($1, $2, $3, $4, 'pending', $5, now())
        ON CONFLICT (id) DO UPDATE
          SET amount = EXCLUDED.amount, destination = EXCLUDED.destination,
              private = EXCLUDED.private, updated_at = now()`,
-      [num(f.id), str(f.amount), addr(f.destination), f.private === true, ev.ledger]
+      [id, amount, destination, f.private === true, ev.ledger]
     )
   },
 
   async tre_vote(client, ev) {
+    const id = requireId(ev, 'id')
+    const support = requireBool(ev, 'support')
     const f = ev.fields
-    const column = f.support === true ? 'votes_for' : 'votes_against'
+    const column = support ? 'votes_for' : 'votes_against'
     await client.query(
       `UPDATE treasury_proposals
          SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
        WHERE id = $1`,
-      [num(f.id), weightOf(f)]
+      [id, weightOf(f)]
     )
   },
 
   async tre_exec(client, ev) {
+    const id = requireId(ev, 'id')
+    const destination = requireAddr(ev, 'destination')
     const f = ev.fields
     await client.query(
       `UPDATE treasury_proposals
          SET status = 'executed', executed_ledger = $2, updated_at = now()
        WHERE id = $1`,
-      [num(f.id), ev.ledger]
+      [id, ev.ledger]
     )
-    await notify(client, ev, addr(f.destination), 'success', 'Treasury withdrawal executed', `${str(f.amount)} was sent to your address.`)
+    await notify(client, ev, destination, 'success', 'Treasury withdrawal executed', `${str(f.amount)} was sent to your address.`)
   },
 
   async staked(client, ev) {
@@ -337,18 +437,20 @@ const handlers: Record<string, Handler> = {
     // address. A `staked` for an unknown address is still in the raw `events`
     // log; it just doesn't create a phantom member. Same reasoning as
     // `name_reg`, and identical to `unstaked` now.
-    const f = ev.fields
+    const member = requireAddr(ev, 'member')
+    const newStake = requireAmount(ev, 'new_stake')
     await client.query(
       `UPDATE members SET stake = $2, updated_at = now() WHERE address = $1`,
-      [addr(f.member), str(f.new_stake)]
+      [member, newStake]
     )
   },
 
   async unstaked(client, ev) {
-    const f = ev.fields
+    const member = requireAddr(ev, 'member')
+    const newStake = requireAmount(ev, 'new_stake')
     await client.query(
       `UPDATE members SET stake = $2, updated_at = now() WHERE address = $1`,
-      [addr(f.member), str(f.new_stake)]
+      [member, newStake]
     )
   },
 
@@ -368,10 +470,11 @@ const handlers: Record<string, Handler> = {
     // `register_member` builds a fresh Member record on join and the name is
     // re-registrable at any time, so the fix is a re-register, and the raw
     // event is retained regardless.
+    const owner = requireAddr(ev, 'owner')
     const f = ev.fields
     await client.query(
       `UPDATE members SET name = $2, updated_at = now() WHERE address = $1`,
-      [addr(f.owner), typeof f.name === 'string' ? f.name : String(f.name ?? '')]
+      [owner, typeof f.name === 'string' ? f.name : String(f.name ?? '')]
     )
   },
 
@@ -380,15 +483,35 @@ const handlers: Record<string, Handler> = {
     await notify(client, ev, addr(f.voter), 'info', 'Private vote committed', `Your commitment for proposal #${str(f.proposal_id)} was recorded.`)
   },
 
+  async doc_attn(client, ev) {
+    // Existence/history of a proposal's attached documents (issue #44) — not
+    // the content hash, which stays read live from the contract via
+    // get_document (see the README's Event catalog). Doesn't touch
+    // loan_proposals/treasury_proposals: the contract already validated
+    // proposal_exists before publishing this event, and this handler has no
+    // reason to materialize or check a proposal row for it.
+    const proposalId = requireId(ev, 'proposal_id')
+    const caller = requireAddr(ev, 'caller')
+    const kind = requireProposalKind(ev, 'kind')
+    await client.query(
+      `INSERT INTO documents (event_id, proposal_id, kind, caller, ledger, tx_hash)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (event_id) DO NOTHING`,
+      [ev.id, proposalId, kind, caller, ev.ledger, ev.txHash]
+    )
+  },
+
   async revealed(client, ev) {
     // A revealed commit-reveal ballot counts like a treasury vote.
+    const proposalId = requireId(ev, 'proposal_id')
+    const support = requireBool(ev, 'support')
     const f = ev.fields
-    const column = f.support === true ? 'votes_for' : 'votes_against'
+    const column = support ? 'votes_for' : 'votes_against'
     await client.query(
       `UPDATE treasury_proposals
          SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
        WHERE id = $1`,
-      [num(f.proposal_id), weightOf(f)]
+      [proposalId, weightOf(f)]
     )
   },
 }

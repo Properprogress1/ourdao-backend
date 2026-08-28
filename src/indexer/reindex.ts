@@ -24,6 +24,7 @@ const DERIVED_TABLES = [
   'loan_proposals',
   'members',
   'interest_distributions',
+  'documents',
 ] as const
 
 /**

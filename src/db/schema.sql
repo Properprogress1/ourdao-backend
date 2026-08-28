@@ -24,13 +24,19 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 -- the cursor was last advanced (Soroban getEvents exposes no per-event hash);
 -- it is forensic context for a detected discontinuity, not a verified
 -- processed-ledger hash. See issue #23 / README "Reorg detection".
+-- `observed_tip_ledger` (issue #45) is the RPC's most recently observed chain
+-- tip — freshness/reporting only, distinct from `last_ledger` (the highest
+-- ledger actually folded, which the reorg continuity check uses). An empty
+-- getEvents page must never advance `last_ledger` from this value; see
+-- README "Reorg detection" and src/indexer/poller.ts.
 CREATE TABLE IF NOT EXISTS indexer_cursor (
-  id               SMALLINT PRIMARY KEY DEFAULT 1,
-  paging_token     TEXT,
-  last_ledger      BIGINT,
-  last_ledger_hash TEXT,
-  contract_id      TEXT,
-  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  id                  SMALLINT PRIMARY KEY DEFAULT 1,
+  paging_token        TEXT,
+  last_ledger         BIGINT,
+  last_ledger_hash    TEXT,
+  observed_tip_ledger BIGINT,
+  contract_id         TEXT,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT indexer_cursor_singleton CHECK (id = 1)
 );
 
@@ -166,3 +172,43 @@ CREATE TABLE IF NOT EXISTS interest_distributions (
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS interest_distributions_ledger_idx ON interest_distributions (ledger);
+
+-- Quarantine record for a `doc_attn`-style deterministic handler failure
+-- (issue #43). The append-only `events` row for a quarantined event is never
+-- mutated or deleted — this is a separate, additive record of what the
+-- poller gave up on folding and why, so the rest of the page can proceed and
+-- the cursor can advance past it. Not a derived table: never truncated by
+-- npm run reindex, since a reindex re-attempts every raw event fresh and
+-- either folds it (if the handler's since been fixed) or doesn't touch this
+-- table at all (reindex runs applyEvent directly, not the poller's
+-- quarantine path).
+CREATE TABLE IF NOT EXISTS failed_events (
+  id         BIGSERIAL PRIMARY KEY,
+  event_id   TEXT NOT NULL,
+  symbol     TEXT NOT NULL,
+  ledger     BIGINT NOT NULL,
+  error      TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS failed_events_event_id_idx ON failed_events (event_id);
+CREATE INDEX IF NOT EXISTS failed_events_ledger_idx ON failed_events (ledger);
+
+-- One row per `doc_attn` event (issue #44): the existence and history of a
+-- proposal's attached documents, not the content hash itself (that's read
+-- live from the contract via get_document — see the README's Event catalog).
+-- `kind` distinguishes loan vs treasury proposals, since their ids are drawn
+-- from independent sequences and collide (loan proposal 3 and treasury
+-- proposal 3 are different entities) — mirrors ourdao-contracts'
+-- ProposalKind. `event_id UNIQUE` is the same re-delivery-safe idempotency
+-- key `interest_distributions` uses.
+CREATE TABLE IF NOT EXISTS documents (
+  id          BIGSERIAL PRIMARY KEY,
+  event_id    TEXT NOT NULL UNIQUE,
+  proposal_id INTEGER NOT NULL,
+  kind        TEXT NOT NULL,
+  caller      TEXT NOT NULL,
+  ledger      BIGINT NOT NULL,
+  tx_hash     TEXT,
+  attached_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS documents_proposal_idx ON documents (kind, proposal_id, ledger DESC);

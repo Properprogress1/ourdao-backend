@@ -24,6 +24,7 @@ describe('API: pagination and path validation', () => {
     `/api/notifications?address=${VALID_ADDRESS}`,
     '/api/events',
     '/api/admin/log',
+    '/api/admin/failed-events',
     '/api/interest',
   ])('clamps invalid limits on %s before querying', async (path) => {
     const spy = vi.spyOn(pool, 'query')
@@ -39,7 +40,7 @@ describe('API: pagination and path validation', () => {
     }
   })
 
-  it.each(['/api/loans', '/api/events', '/api/interest'])(
+  it.each(['/api/loans', '/api/events', '/api/interest', '/api/documents'])(
     'rejects malformed cursors on %s before querying',
     async (path) => {
       const spy = vi.spyOn(pool, 'query')

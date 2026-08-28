@@ -33,6 +33,8 @@ const TABLES = [
   'events',
   'indexer_cursor',
   'interest_distributions',
+  'documents',
+  'failed_events',
 ]
 
 export async function resetDb(): Promise<void> {

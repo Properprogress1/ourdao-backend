@@ -12,6 +12,8 @@ import type {
   TreasuryProposalRow,
   EventRow,
   InterestDistributionRow,
+  DocumentRow,
+  FailedEventRow,
 } from '../../types.js'
 import { authenticateRequest, MemoryNonceStore, extractAuthHeaders } from '../../auth.js'
 
@@ -298,6 +300,56 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     )
   })
 
+  // --- Documents attached to a proposal (issue #44, ?before=<ledger> cursor) ---
+  // One row per `doc_attn` event — existence/history only, never the content
+  // hash (still read live from the contract via get_document). A single
+  // `?kind=&proposal_id=` endpoint rather than two per-family routes: loan
+  // and treasury proposal ids are drawn from independent sequences and
+  // collide, so `kind` is required alongside `proposal_id` either way, and
+  // one route keeps the pagination/validation logic in one place.
+  app.get('/documents', async (req, reply) => {
+    const q = req.query as Record<string, unknown>
+    const l = limit(q.limit)
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    const kind = q.kind
+    if (kind !== 'loan' && kind !== 'treasury') {
+      return reply.code(400).send({ error: 'kind query param must be "loan" or "treasury"' })
+    }
+    if (typeof q.proposal_id !== 'string' || !/^[0-9]+$/.test(q.proposal_id)) {
+      return reply.code(400).send({ error: 'proposal_id query param is required' })
+    }
+    const proposalId = Number(q.proposal_id)
+    const params: unknown[] = [kind, proposalId]
+    let where = `WHERE kind = $1 AND proposal_id = $2`
+    if (before !== null) {
+      params.push(before)
+      where += ` AND ledger < $${params.length}`
+    }
+    params.push(l)
+    return query<DocumentRow>(
+      `SELECT id, proposal_id, kind, caller, ledger, tx_hash, attached_at
+         FROM documents ${where}
+        ORDER BY ledger DESC, id DESC LIMIT $${params.length}`,
+      params
+    )
+  })
+
+  // --- Quarantined events (issue #43) ---
+  // A deterministically-throwing handler no longer wedges the indexer
+  // forever — the poller isolates the offending event, records it here
+  // (without touching the append-only `events` row), and moves on. This is
+  // the operator-facing view of that; `/api/stats.quarantinedEvents` is the
+  // dashboard-facing count.
+  app.get('/admin/failed-events', async (req) => {
+    const q = req.query as Record<string, unknown>
+    const l = limit(q.limit)
+    return query<FailedEventRow>(
+      'SELECT * FROM failed_events ORDER BY id DESC LIMIT $1',
+      [l]
+    )
+  })
+
   // --- Aggregate stats (with indexer freshness — issue #2) ---
   //
   // Issue #18: /api/stats is the hottest endpoint (the frontend polls it
@@ -323,7 +375,9 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       principal_lent: string | null
       principal_repaid: string | null
       value_defaulted: string | null
+      quarantined_events: string
       last_ledger: number | null
+      observed_tip_ledger: number | null
       cursor_updated_at: string | null
     }>(
       // Member counts mirror the contract's two distinct getters:
@@ -347,7 +401,9 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
          (SELECT principal_lent     FROM dao_totals WHERE id = 1)                  AS principal_lent,
          (SELECT principal_repaid   FROM dao_totals WHERE id = 1)                  AS principal_repaid,
          (SELECT value_defaulted    FROM dao_totals WHERE id = 1)                  AS value_defaulted,
+         (SELECT count(*) FROM failed_events)                                     AS quarantined_events,
          (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
+         (SELECT observed_tip_ledger FROM indexer_cursor WHERE id = 1)             AS observed_tip_ledger,
          (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at`
     )
     const cursorUpdatedAt = row?.cursor_updated_at
@@ -371,7 +427,9 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       principalLent: String(row?.principal_lent ?? '0'),
       principalRepaid: String(row?.principal_repaid ?? '0'),
       valueDefaulted: String(row?.value_defaulted ?? '0'),
+      quarantinedEvents: Number(row?.quarantined_events ?? 0),
       lastIndexedLedger: row?.last_ledger ?? null,
+      observedTipLedger: row?.observed_tip_ledger ?? null,
       secondsSinceUpdate,
       indexerStale: isStale,
     }

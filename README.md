@@ -29,6 +29,8 @@ This repository is one of three that make up OurDAO:
 - [Database schema](#database-schema)
 - [Event catalog](#event-catalog)
 - [API reference](#api-reference)
+  - [Reorg detection](#reorg-detection)
+  - [Quarantine](#quarantine)
 - [Testing](#testing)
 - [Security notes](#security-notes)
 - [Status](#status)
@@ -92,6 +94,7 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `DRAIN_MAX_PAGES` | Max pages per poll drain cycle when catching up (default 20). |
 | `DRAIN_MAX_MS` | Max wall-clock ms for a single drain cycle (default 30s). |
 | `INDEXER_STALE_AFTER_MS` | How long (ms) the cursor can be idle before `/ready` reports stale (default 120s). |
+| `INDEXER_QUARANTINE_AFTER_FAILURES` | After this many consecutive whole-page failures with the same error on the same page, the poller quarantines the offending event(s) instead of retrying forever (default 3). See [Quarantine](#quarantine). |
 | `INDEXER_RESET_ON_CONTRACT_CHANGE` | `true` for one boot to wipe the cursor + derived tables when `CONTRACT_ID` changes (redeploy). Default `false` — a mismatch refuses to start. See [Redeploying the contract](#redeploying-the-contract). |
 | `CORS_ORIGIN` | Comma-separated allowed origins for the API (the frontend's URL). Defaults to `http://localhost:3000`. Set to `*` to allow all origins (a warning is logged at startup). |
 | `RATE_LIMIT_MAX` | Global rate limit: max requests per window per IP (default 100). |
@@ -112,13 +115,15 @@ To add a schema change: update `schema.sql` to the new desired shape (for fresh 
 | Table | Purpose | Notable columns |
 |---|---|---|
 | `schema_migrations` | Tracks which numbered migrations have been applied | `version`, `name`, `applied_at` |
-| `indexer_cursor` | Single-row resume state for the poll loop | `paging_token`, `last_ledger`, `contract_id` (cursor is discarded on a cold start if it belongs to a different contract) |
+| `indexer_cursor` | Single-row resume state for the poll loop | `paging_token`, `last_ledger` (highest ledger actually folded), `observed_tip_ledger` (RPC-observed chain tip — freshness only, kept separate from `last_ledger` since issue #45), `contract_id` (cursor is discarded on a cold start if it belongs to a different contract) |
 | `events` | Append-only raw event log — the source everything else is derived from | `symbol`, `topics` (JSONB), `data` (JSONB), `tx_hash` |
 | `members` | Current membership state | `contribution`, `stake`, `has_active_loan`, `pending_claimed`, `name` (from the registry), `defaults_count` |
 | `loan_proposals` | Loan votes in flight | `status` (`pending`/`approved`/`rejected`), `votes_for`, `votes_against`, `voter_count` |
 | `loans` | Disbursed loans | `status` (`active`/`repaid`/`defaulted`), `total_repayment`, `outstanding`, `due_time`. **`id` doubles as the originating `loan_proposals.id`** — the contract reuses the proposal's own id for the disbursed loan rather than a separate counter, since a proposal produces at most one loan. |
 | `treasury_proposals` | Treasury withdrawal votes | `private` (routed through commit-reveal instead of open voting), `status`, `votes_for`, `votes_against`, `voter_count` |
 | `notifications` | Per-address notification feed | `type`, `read`, indexed on `(address, read)` |
+| `documents` | Existence/history of a proposal's attached documents (issue #44) — one row per `doc_attn` event, never the content hash itself | `proposal_id`, `kind` (`loan`/`treasury` — loan and treasury proposal ids collide, drawn from independent sequences), `caller`, `ledger` |
+| `failed_events` | Quarantine record for a handler that failed deterministically (issue #43) — additive, never mutates the `events` row it came from | `event_id`, `symbol`, `ledger`, `error` |
 
 On-chain `i128` amounts are stored as `NUMERIC(40,0)` (an i128's max value is ~1.7×10³⁸, which fits under 10³⁹) and returned from the API as **decimal strings**, never JSON numbers, to avoid silent precision loss — this was in fact a real bug found and fixed during development: `pg` returns Postgres `BIGINT` columns as JS strings by default, and the original code assumed they came back as numbers.
 
@@ -127,6 +132,8 @@ On-chain `i128` amounts are stored as `NUMERIC(40,0)` (an i128's max value is ~1
 **Vote tallies are stake-weighted, not a headcount.** The contract grants each voter `1 + min(stake / STAKE_WEIGHT_UNIT, MAX_STAKE_BONUS)` voting power (currently up to 6) and sums that into `for_votes`/`against_votes`. `votes_for`/`votes_against` mirror that (hence `NUMERIC(40,0)`, matching the contract's own field width, not a plain vote count); `voter_count` is the distinct-voter headcount alongside it, so a client can show both "7 members voted" and "carrying 19 voting power." **The contract doesn't publish the weight it applied yet** — `loan_vote`/`tre_vote`/`revealed` currently carry only `support` — so today every vote folds in as weight 1 regardless of stake, and `votes_for`/`votes_against` under-count for any staked voter until [the upstream fix](https://github.com/ourdao/ourdao-contracts) lands. The decoder and handlers already read a `weight` field the moment the contract adds one, with no further backend change needed.
 
 **A loan's `outstanding` balance starts at `total_repayment`, not the principal.** The contract collects `total_repayment = amount + interest` on `repay_loan`, so a loan is never worth just its principal from a borrower's perspective. `loan_appr` doesn't publish `total_repayment` (only the disbursed `amount`), so the indexer sources it from the just-approved `loan_proposals` row instead — `loans.id == loan_proposals.id` is a documented contract invariant, and that row already carries `total_repayment` from `loan_req`/`loan_edit`. This depends on that proposal row existing, which it will unless the indexer started mid-history; if it's missing, `total_repayment` falls back to the principal. `due_time` has the same gap — the contract computes it but doesn't publish it on `loan_appr` — so it's `NULL` until that's fixed upstream. `GET /api/loans` and `/api/loans/:id` also expose `interest_charge` and `repaid_amount`, both derived from `total_repayment` at read time.
+
+**Required fields are validated, not coerced (issue #42).** Every handler in `src/indexer/handlers.ts` reads its decoded fields through either the `require*` helpers (`requireAddr`/`requireId`/`requireAmount`/`requireBool`/`requireProposalKind`) or the older `str`/`num`/`addr` coercion helpers. The `require*` helpers are for a field a derived row depends on — a missing or malformed one throws instead of silently coercing into a plausible-looking default (a missing amount becoming `'0'`, a bad id becoming `NULL` and matching zero rows, a non-string address becoming `''`). `str`/`num`/`addr` are kept only for genuinely optional fields with no on-chain equivalent yet (`weight`, `due_time`) or that no stored row depends on. A thrown `FieldValidationError` rolls back the write and is handled the same way any other deterministic handler error is — see [Quarantine](#quarantine).
 
 ### Redeploying the contract
 
@@ -162,7 +169,7 @@ The full topic-symbol → data-tuple mapping this service decodes (kept in sync 
 | `name_reg` | `name, owner` | updates the member's registered name |
 | `committed` | `proposal_id, voter` | notifies the voter their commit was recorded |
 | `revealed` | `proposal_id, voter, support`, plus a reserved `weight` not yet published | tallies the same as an open vote |
-| `doc_attn` | `kind, proposal_id, caller` | (raw log only — the content hash itself is read live from the contract, not indexed) |
+| `doc_attn` | `kind, proposal_id, caller` | inserts a `documents` history row (issue #44) — existence/history only; the content hash itself is still read live from the contract via `get_document`, never indexed |
 | `init`, `admin_add`, `admin_rem`, `threshold`, `policy`, `paused`, `unpaused` | varies | admin/governance events — surfaced via `/api/admin/log`, not folded into a derived table |
 
 ## API reference
@@ -173,7 +180,7 @@ Base path: `/api`.
 |---|---|
 | `GET /health` | Liveness check + the currently configured contract id. No DB round trip. |
 | `GET /ready` | Readiness probe — checks Postgres reachability and indexer freshness. Returns `503` with a `reason` when Postgres is down or the indexer cursor is stale. |
-| `GET /api/stats` | Aggregate counts (members, loans, proposals) + defaulted-loan count/value + lifetime money figures (`interestCollected`, `principalLent`, `principalRepaid`, `valueDefaulted`, all decimal strings) + the last indexed ledger. Cached in-process for `STATS_CACHE_MS`; sets `Cache-Control`. With more than one API instance the cached figures may briefly disagree. |
+| `GET /api/stats` | Aggregate counts (members, loans, proposals) + defaulted-loan count/value + lifetime money figures (`interestCollected`, `principalLent`, `principalRepaid`, `valueDefaulted`, all decimal strings) + `quarantinedEvents` (issue #43) + `lastIndexedLedger` (highest ledger actually folded) and `observedTipLedger` (RPC-observed chain tip, issue #45) as the useful "folded to X, chain is at Y" pair. Cached in-process for `STATS_CACHE_MS`; sets `Cache-Control`. With more than one API instance the cached figures may briefly disagree. |
 | `GET /api/interest` | Interest-distribution history — one row per `interest` event (`amount` collected, `active_members` at that distribution). `?before=<ledger>` cursor. |
 | `GET /api/members` | Active members. |
 | `GET /api/members/:address` | Single member. |
@@ -186,6 +193,8 @@ Base path: `/api`.
 | `PATCH /api/notifications/read-all?address=` | Mark every unread notification for an address read. |
 | `GET /api/events` | Raw event feed. Optional `?symbol=`, `?before=<ledger>`. |
 | `GET /api/admin/log` | Admin/governance audit trail — init, admin add/remove, threshold changes, policy changes, pause/unpause. |
+| `GET /api/documents?kind=&proposal_id=` | A proposal's attached-document history (issue #44) — existence/history only, never the content hash (still read live from the contract via `get_document`). `kind` (`loan` or `treasury`) and `proposal_id` are both required, since loan and treasury proposal ids are drawn from independent sequences and collide. `?before=<ledger>` cursor. |
+| `GET /api/admin/failed-events` | Quarantined events (issue #43) — the operator-facing detail behind `/api/stats.quarantinedEvents`. Each row has the event id, symbol, ledger, and the error that quarantined it; the raw `events` row itself is left untouched. |
 
 All list endpoints accept `?limit=` (default 50, max 200). `?before=` is a cursor: pass the `id`/`ledger` of the last row you saw to page further back. On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
 
@@ -197,6 +206,17 @@ Stellar's consensus gives fast finality, so a deep reorg is genuinely unlikely �
 - Each poll checks continuity: if the RPC's reported latest ledger is **below** the last folded ledger, or a fetched page contains an event from a ledger already folded past, the indexer **halts** with a loud log line instead of retrying.
 - **Recovery:** confirm the true chain state, then run `npm run reindex` (`node dist/indexer/reindex.js` in the container). It truncates the derived tables and rebuilds them from the raw `events` log in one transaction — the log is authoritative and untouched. A rebuild produces state identical to the incremental fold (asserted by a test), so `reindex` is also the repair path for the historical-data bugs tracked in other issues.
 - **Unrecoverable:** events that were orphaned *and* already pruned from the RPC's ~24h window can't be re-fetched; `reindex` rebuilds from whatever the raw log holds.
+- **`last_ledger` only ever advances to a ledger whose events were actually folded (issue #45).** An earlier version fell back to the RPC's reported chain tip on an empty `getEvents` page, which conflated "highest ledger folded" with "how current the RPC is" — during catch-up, one empty page could jump `last_ledger` to the tip, and the very next real (but still historically-earlier) page would then look like a rewind and trigger a false halt. The RPC-observed tip is tracked in its own column, `observed_tip_ledger` — freshness reporting only (`/ready`, `/api/stats.observedTipLedger`), never fed into the continuity check above.
+
+### Quarantine
+
+A handler bug used to be able to wedge the indexer permanently: `ingestPage` folds a whole page in one transaction, so one event whose handler throws rolled back the entire page, and the poll loop retried the *same* page forever behind exponential backoff (capped at `POLL_MAX_BACKOFF_MS`) — the process stayed up and kept logging the same error, but indexed nothing (issue #43).
+
+- The poller can't tell a transient failure (RPC hiccup, a DB restart — expected to clear on retry) from a deterministic one (a handler bug, a value that overflows its column) from the error alone. It infers it from repetition: if the *same* page fails with the *same* error `INDEXER_QUARANTINE_AFTER_FAILURES` times in a row (default 3), that's not transient.
+- Once that threshold is hit, the page is retried **one event per transaction** instead of the whole page at once. Each event's raw log row is written (and stays written) regardless of whether folding it succeeds; if folding throws, that one transaction rolls back and the event is recorded in `failed_events` (id, symbol, ledger, error) instead — every other event in the page still folds normally, and the cursor advances past all of them.
+- A `ReorgDetectedError` is never quarantined, on either path — a genuine rewind still halts the indexer immediately, exactly as in [Reorg detection](#reorg-detection) above.
+- Once the handler bug is fixed, `npm run reindex` folds a previously-quarantined event correctly with no extra step — it replays the raw log directly through `applyEvent`, independent of the poller's quarantine bookkeeping.
+- Quarantined events are visible at `GET /api/admin/failed-events` and counted in `GET /api/stats.quarantinedEvents`.
 
 ### Docker
 
@@ -220,9 +240,11 @@ npm run lint
 npm run typecheck
 ```
 
-48 tests across 8 files, covering:
+145 tests across 18 files, covering:
 - Event decode logic (`decodeEvent`, `toJsonSafe`) in isolation.
-- Every indexer handler (membership, loan lifecycle including defaults, treasury, staking, registry, commit-reveal privacy) against a real Postgres instance — not mocked.
+- Every indexer handler (membership, loan lifecycle including defaults, treasury, staking, registry, commit-reveal privacy, document attachments) against a real Postgres instance — not mocked.
+- Required-field validation per handler (issue #42) and the poller's quarantine path for a deterministically-failing handler (issue #43), including that a genuine reorg is still never quarantined.
+- The `last_ledger`/`observed_tip_ledger` split (issue #45): an empty page during catch-up doesn't produce a false reorg halt.
 - Every API route, exercised through a real Fastify instance via `.inject()`.
 
 Tests apply the real `schema.sql` and truncate all tables between runs (`test/db.ts`). CI runs all of the above plus `npm run build` against a Postgres service container on every push and PR (`.github/workflows/ci.yml`).
@@ -241,7 +263,7 @@ MVP — the indexer and read API are implemented for the full event catalog, inc
 
 - Reorg handling is *detection only* — the indexer halts on a ledger discontinuity and an operator rebuilds derived state from the raw log with `npm run reindex` (see [Reorg detection](#reorg-detection)). There is no automatic rollback and replay of orphaned events.
 - Single indexer instance — no leader-election or multi-instance coordination if you wanted to run more than one worker for redundancy.
-- IPFS pinning for document metadata is a frontend/contract-facing concern (`ourdao-frontend`'s `lib/ipfs.ts`), not something this service indexes today beyond the raw `doc_attn` event.
+- IPFS pinning for document metadata is a frontend/contract-facing concern (`ourdao-frontend`'s `lib/ipfs.ts`) — this service indexes `doc_attn`'s existence/history (`documents`, `GET /api/documents`) but never the content hash or its content.
 
 ## Contributing
 
