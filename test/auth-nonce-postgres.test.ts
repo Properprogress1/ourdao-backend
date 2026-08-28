@@ -44,7 +44,7 @@ describe('PostgresNonceStore', () => {
       'SELECT * FROM auth_nonces WHERE address = $1',
       [address]
     )
-    expect(row).toBeUndefined()
+    expect(row).toBeNull()
   })
 
   it('prevents double consumption of the same nonce', async () => {
@@ -160,7 +160,7 @@ describe('PostgresNonceStore', () => {
     const row1 = await queryOne('SELECT * FROM auth_nonces WHERE address = $1', [address1])
     const row2 = await queryOne('SELECT * FROM auth_nonces WHERE address = $1', [address2])
     
-    expect(row1).toBeUndefined()
+    expect(row1).toBeNull()
     expect(row2).toBeDefined()
   })
 

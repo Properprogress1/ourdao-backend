@@ -212,3 +212,15 @@ CREATE TABLE IF NOT EXISTS documents (
   attached_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS documents_proposal_idx ON documents (kind, proposal_id, ledger DESC);
+
+-- Authentication nonces for Stellar-signed login (issue #63, #66).
+-- Stores one pending nonce per address; used by MemoryNonceStore for local
+-- single-instance testing, and by PostgresNonceStore for multi-instance
+-- production deployments where nonces must survive process restarts.
+CREATE TABLE IF NOT EXISTS auth_nonces (
+  address    TEXT PRIMARY KEY,
+  nonce      TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS auth_nonces_expires_at_idx ON auth_nonces (expires_at);
