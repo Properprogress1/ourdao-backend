@@ -56,6 +56,18 @@ describe('API: /health and /ready', () => {
     expect(body.status).toBe('ok')
   })
 
+  it('GET /version returns 200 with version info', async () => {
+    const res = await app.inject({ method: 'GET', url: '/version' })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(typeof body.version).toBe('string')
+    expect(typeof body.commit).toBe('string')
+    expect(typeof body.buildDate).toBe('string')
+    // Should have sensible defaults when env vars are not set
+    expect(body.commit).toBe('unknown')
+    expect(body.buildDate).toBe('unknown')
+  })
+
   it('GET /ready returns 200 with cold start when no cursor exists', async () => {
     const res = await app.inject({ method: 'GET', url: '/ready' })
     expect(res.statusCode).toBe(200)

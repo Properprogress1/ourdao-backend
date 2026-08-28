@@ -57,6 +57,8 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
   db: {
     // pg reads PG* env vars automatically; connectionString wins when set.
     connectionString: str(env, 'DATABASE_URL') || undefined,
+    // Nonce store implementation: 'postgres' for production (multi-instance), 'memory' for testing (issue #66)
+    nonceStore: str(env, 'NONCE_STORE', 'postgres') as 'postgres' | 'memory',
   },
   stellar: {
     contractId: str(env, 'CONTRACT_ID'),

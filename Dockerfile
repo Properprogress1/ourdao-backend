@@ -26,6 +26,16 @@ RUN npm ci --omit=dev
 # without running as root.
 COPY --from=build --chown=node:node /app/dist ./dist
 
+# Promoted from build-time ARG to runtime ENV so the process can read them via GET /version
+ARG SOURCE_COMMIT=unknown
+ARG BUILD_DATE=unknown
+ENV SOURCE_COMMIT=${SOURCE_COMMIT}
+ENV BUILD_DATE=${BUILD_DATE}
+
+LABEL org.opencontainers.image.source="https://github.com/ourdao/ourdao-backend" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
 USER node
 
 # Liveness probe: /health is a no-DB check that the process is up. (/ready
@@ -34,14 +44,6 @@ USER node
 # it would never go healthy for an API-only container with no worker.)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-4000}/health" || exit 1
-
-# Populated at build time: `--build-arg SOURCE_COMMIT=$(git rev-parse HEAD)`
-# `--build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)`
-ARG SOURCE_COMMIT=unknown
-ARG BUILD_DATE=unknown
-LABEL org.opencontainers.image.source="https://github.com/ourdao/ourdao-backend" \
-      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
-      org.opencontainers.image.created="${BUILD_DATE}"
 
 ENTRYPOINT ["/sbin/tini", "--"]
 # Default: the API. Run the indexer from the same image with:

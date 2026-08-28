@@ -16,7 +16,7 @@ import type {
   DocumentRow,
   FailedEventRow,
 } from '../../types.js'
-import { authenticateRequest, MemoryNonceStore, extractAuthHeaders } from '../../auth.js'
+import { authenticateRequest, isValidStellarAddress, extractAuthHeaders, type NonceStore } from '../../auth.js'
 
 // Small helper: clamp a `limit` query param to a sane range.
 function limit(v: unknown, def = 50, max = 200): number {
@@ -74,21 +74,41 @@ function withLoanDerived(loan: LoanRow): LoanRow & { interest_charge: string; re
   }
 }
 
-export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: MemoryNonceStore }): Promise<void> {
+export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: NonceStore }): Promise<void> {
   const { nonceStore } = opts
   
-  // --- Authentication challenge ---
-  app.get<{ Querystring: { address: string } }>('/auth/challenge', async (req, reply) => {
+  // --- Authentication challenge (issue #65) ---
+  // Stricter rate limit on this endpoint to prevent DoS attacks
+  app.get<{ Querystring: { address: string } }>('/auth/challenge', {
+    config: {
+      rateLimit: {
+        max: config.http.rateLimitEventsMax, // Use the same stricter limit as /events
+        timeWindow: config.http.rateLimitWindowMs,
+      },
+    },
+  }, async (req, reply) => {
     const { address } = req.query
     if (!address) {
       return reply.code(400).send({ error: 'address query param is required' })
     }
     
+    // Validate address is a well-formed Stellar public key (issue #65)
+    if (!isValidStellarAddress(address)) {
+      return reply.code(400).send({ error: 'invalid Stellar address' })
+    }
+    
+    // Bound the request: reject over-long address (issue #65)
+    const MAX_ADDRESS_LENGTH = 56 // Stellar public keys are 56 characters
+    if (address.length > MAX_ADDRESS_LENGTH) {
+      return reply.code(400).send({ error: 'address too long' })
+    }
+    
     try {
       const nonce = await nonceStore.issue(address)
       return { nonce }
-    } catch {
-      return reply.code(500).send({ error: 'Failed to generate challenge' })
+    } catch (error) {
+      // Nonce store capacity exceeded
+      return reply.code(503).send({ error: 'Service temporarily unavailable' })
     }
   })
   

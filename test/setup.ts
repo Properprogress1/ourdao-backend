@@ -11,3 +11,7 @@ process.env.DATABASE_URL =
 // logger. Route tests build a real server per-test, so leaving it at the
 // 'info' default would drown test output in per-request log lines.
 process.env.LOG_LEVEL ??= 'silent'
+
+// Run migrations before tests
+import { migrate } from './src/db/migrate.js'
+await migrate()

@@ -212,3 +212,12 @@ CREATE TABLE IF NOT EXISTS documents (
   attached_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS documents_proposal_idx ON documents (kind, proposal_id, ledger DESC);
+
+-- Authentication nonces for Stellar-signed login (issues #63, #66)
+CREATE TABLE IF NOT EXISTS auth_nonces (
+  address    TEXT PRIMARY KEY,
+  nonce      TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS auth_nonces_expires_at_idx ON auth_nonces (expires_at);

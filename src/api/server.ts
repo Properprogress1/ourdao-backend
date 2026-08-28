@@ -5,7 +5,11 @@ import etag from '@fastify/etag'
 import { config } from '../config.js'
 import { pool } from '../db/index.js'
 import { registerRoutes } from './routes/index.js'
-import { MemoryNonceStore } from '../auth.js'
+import { registerStreamEndpoint } from './stream.js'
+import { MemoryNonceStore, PostgresNonceStore, type NonceStore } from '../auth.js'
+import { readFileSync } from 'fs'
+import { dirname, join } from 'path'
+import { fileURLToPath } from 'url'
 
 interface CursorRow {
   last_ledger: number | null
@@ -13,12 +17,35 @@ interface CursorRow {
   updated_at: string | null
 }
 
+interface PackageJson {
+  version: string
+}
+
+// Helper to read package.json version
+function readPackageVersion(): string {
+  try {
+    const __dirname = dirname(fileURLToPath(import.meta.url))
+    const pkgPath = join(__dirname, '../../package.json')
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as PackageJson
+    return pkg.version
+  } catch {
+    return 'unknown'
+  }
+}
+
 export async function buildServer(): Promise<FastifyInstance> {
   const app = Fastify({
     logger: { level: process.env.LOG_LEVEL ?? 'info' },
     trustProxy: config.http.trustProxy === 'true',
   })
-  const nonceStore = new MemoryNonceStore()
+
+  // Select nonce store implementation based on config (issue #66)
+  let nonceStore: NonceStore
+  if (config.db.nonceStore === 'postgres') {
+    nonceStore = new PostgresNonceStore(pool)
+  } else {
+    nonceStore = new MemoryNonceStore()
+  }
 
   await app.register(etag)
 
@@ -38,14 +65,24 @@ export async function buildServer(): Promise<FastifyInstance> {
     keyGenerator: (req: { ip?: string; socket?: { remoteAddress?: string } }) => req.ip ?? req.socket?.remoteAddress ?? 'unknown',
     addHeadersOnExceeding: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true },
     addHeaders: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true, 'retry-after': true },
-    allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready',
+    allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready' || req.url === '/version',
   })
 
   // ── Routes ──
   await app.register(registerRoutes, { prefix: '/api', nonceStore })
 
+  // ── Stream endpoint (issue #63) ──
+  await registerStreamEndpoint(app, pool)
+
   // ── Liveness probe (issue #2) — no DB round trip ──
   app.get('/health', async () => ({ status: 'ok', contract: config.stellar.contractId || null }))
+
+  // ── Version endpoint (issue #64) — build metadata ──
+  app.get('/version', async () => ({
+    version: readPackageVersion(),
+    commit: process.env.SOURCE_COMMIT ?? 'unknown',
+    buildDate: process.env.BUILD_DATE ?? 'unknown',
+  }))
 
   // ── Readiness probe (issue #2) — checks DB + indexer freshness ──
   app.get('/ready', async (_req, reply) => {
