@@ -5,6 +5,7 @@ import { pool, queryOne } from '../db/index.js'
 import { server, getLatestLedger, getLatestLedgerInfo } from '../stellar/rpc.js'
 import { decodeEvent, type DecodedEvent } from '../stellar/events.js'
 import { applyEvent } from './handlers.js'
+import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
 
 interface CursorRow {
   paging_token: string | null
@@ -16,7 +17,11 @@ interface CursorRow {
   contract_id: string | null
 }
 
-let stopped = false
+// Per-run abort controller — replaced on each runIndexer() call so the flag
+// doesn't persist across runs (issue #48). An AbortController also gives the
+// drain loop (issue #47) a way to check for shutdown between pages.
+let abortController: AbortController | null = null
+let running = false
 
 /** Thrown when the ledger sequence the indexer sees stops being monotonic —
  *  the RPC's reported tip fell below our cursor, or a fetched page contains
@@ -31,11 +36,6 @@ export class ReorgDetectedError extends Error {
   }
 }
 
-// Derived tables rebuilt from the append-only `events` log. Wiped when the
-// indexer is deliberately repointed at a freshly deployed contract (issue
-// #16); `events` itself is kept as the audit trail.
-const DERIVED_TABLES = ['members', 'loan_proposals', 'loans', 'treasury_proposals', 'notifications'] as const
-
 /** Wipe the cursor and every derived table so the indexer can re-index a new
  *  deployment from an empty slate. Destructive — only reached when
  *  INDEXER_RESET_ON_CONTRACT_CHANGE is set. */
@@ -44,6 +44,7 @@ export async function resetForContractChange(): Promise<void> {
   try {
     await client.query('BEGIN')
     await client.query(`TRUNCATE ${DERIVED_TABLES.join(', ')} RESTART IDENTITY`)
+    await resetDaoTotals(client)
     await client.query('DELETE FROM indexer_cursor WHERE id = 1')
     await client.query('COMMIT')
   } catch (err) {
@@ -76,9 +77,9 @@ export async function ensureCursorContract(contractId: string): Promise<void> {
   if (config.indexer.resetOnContractChange) {
     console.warn(
       `[indexer] CONTRACT_ID changed (${saved} -> ${contractId}) and ` +
-        `INDEXER_RESET_ON_CONTRACT_CHANGE is set: wiping the cursor and derived ` +
-        `tables (${DERIVED_TABLES.join(', ')}) and re-indexing the new contract ` +
-        `from scratch. The raw events log is left intact.`
+        `INDEXER_RESET_ON_CONTRACT_CHANGE is set: wiping the cursor, derived ` +
+        `tables (${DERIVED_TABLES.join(', ')}), and dao_totals — re-indexing the ` +
+        `new contract from scratch. The raw events log is left intact.`
     )
     await resetForContractChange()
     return
@@ -333,6 +334,14 @@ export async function fetchOnce(contractId: string): Promise<void> {
   let cursorWritten = false
 
   for (;;) {
+    // Check for shutdown signal between pages (issue #47): a SIGTERM
+    // arriving mid-drain should stop after the in-flight page, not after
+    // the full drain cap.
+    if (abortController?.signal.aborted) {
+      console.log(`[indexer] drain interrupted by shutdown after ${totalPages} page(s), ${totalEvents} event(s)`)
+      break
+    }
+
     const res = await server.getEvents(currentRequest)
     const events = res.events ?? []
     const pageCount = events.length
@@ -401,41 +410,67 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
  *  RPC endpoint doesn't get hammered every `pollIntervalMs`. The delay resets
  *  to the normal interval as soon as a poll succeeds. */
 export async function runIndexer(): Promise<void> {
+  if (running) {
+    throw new Error('Indexer is already running — cannot start a second instance')
+  }
+  running = true
+  abortController = new AbortController()
+
   const contractId = assertContractConfigured()
   await ensureCursorContract(contractId)
   console.log(`[indexer] watching ${contractId} on ${config.stellar.rpcUrl}`)
   let consecutiveFailures = 0
-  while (!stopped) {
-    let delay = config.indexer.pollIntervalMs
-    try {
-      await fetchOnce(contractId)
-      consecutiveFailures = 0
-    } catch (err) {
-      // A ledger discontinuity is not a transient error — retrying would
-      // fold events from a diverged history. Halt loudly (issue #23).
-      if (err instanceof ReorgDetectedError) {
-        console.error(`[indexer] LEDGER DISCONTINUITY DETECTED — halting the indexer. ${err.message}`)
-        console.error(
-          `[indexer] Recovery: confirm the true chain state, then run \`npm run reindex\` to rebuild ` +
-            `the derived tables from the raw events log. See README "Reorg detection".`
+  try {
+    while (!abortController.signal.aborted) {
+      let delay = config.indexer.pollIntervalMs
+      try {
+        await fetchOnce(contractId)
+        consecutiveFailures = 0
+      } catch (err) {
+        // A ledger discontinuity is not a transient error — retrying would
+        // fold events from a diverged history. Halt loudly (issue #23).
+        if (err instanceof ReorgDetectedError) {
+          console.error(`[indexer] LEDGER DISCONTINUITY DETECTED — halting the indexer. ${err.message}`)
+          console.error(
+            `[indexer] Recovery: confirm the true chain state, then run \`npm run reindex\` to rebuild ` +
+              `the derived tables from the raw events log. See README "Reorg detection".`
+          )
+          // Reorg halt is deliberate and permanent for this run — don't
+          // reset, so the caller must explicitly restart (issue #48).
+          throw err
+        }
+        const msg = err instanceof Error ? err.message : String(err)
+        consecutiveFailures += 1
+        delay = Math.min(
+          config.indexer.pollIntervalMs * 2 ** consecutiveFailures,
+          config.indexer.maxBackoffMs
         )
-        stopped = true
-        throw err
+        console.error(
+          `[indexer] poll error (${consecutiveFailures} consecutive): ${msg} — retrying in ${delay}ms`
+        )
       }
-      const msg = err instanceof Error ? err.message : String(err)
-      consecutiveFailures += 1
-      delay = Math.min(
-        config.indexer.pollIntervalMs * 2 ** consecutiveFailures,
-        config.indexer.maxBackoffMs
-      )
-      console.error(
-        `[indexer] poll error (${consecutiveFailures} consecutive): ${msg} — retrying in ${delay}ms`
-      )
+      await sleep(delay)
     }
-    await sleep(delay)
+  } finally {
+    running = false
+    abortController = null
   }
 }
 
-export function stopIndexer(): void {
-  stopped = true
+/** Signal the indexer to stop after the current page completes.
+ *  Returns a promise that resolves once runIndexer() has fully exited. */
+export function stopIndexer(): Promise<void> {
+  console.log('[indexer] shutdown signal received — waiting for current page to complete')
+  if (!abortController || !running) return Promise.resolve()
+  abortController.abort()
+
+  // Poll until the run loop has fully exited so callers (worker.ts) can
+  // safely close the connection pool after this resolves.
+  return new Promise<void>((resolve) => {
+    const check = () => {
+      if (!running) { resolve(); return }
+      setTimeout(check, 50)
+    }
+    check()
+  })
 }

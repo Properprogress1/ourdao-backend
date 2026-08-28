@@ -554,6 +554,13 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     const isStale = cursorUpdatedAt != null &&
       Date.now() - new Date(cursorUpdatedAt).getTime() > config.indexer.staleAfterMs
 
+    const lastLedger = row?.last_ledger ?? null
+    const tipLedger = row?.observed_tip_ledger ?? null
+    const ledgersBehind = lastLedger != null && tipLedger != null && tipLedger > lastLedger
+      ? tipLedger - lastLedger
+      : null
+    const estimatedLagSeconds = ledgersBehind != null ? ledgersBehind * 5 : null
+
     return {
       totalMembers: Number(row?.total_members ?? 0),
       activeMembers: Number(row?.active_members ?? 0),
@@ -569,8 +576,10 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
       principalRepaid: String(row?.principal_repaid ?? '0'),
       valueDefaulted: String(row?.value_defaulted ?? '0'),
       quarantinedEvents: Number(row?.quarantined_events ?? 0),
-      lastIndexedLedger: row?.last_ledger ?? null,
-      observedTipLedger: row?.observed_tip_ledger ?? null,
+      lastIndexedLedger: lastLedger,
+      observedTipLedger: tipLedger,
+      ledgersBehind,
+      estimatedLagSeconds,
       secondsSinceUpdate,
       indexerStale: isStale,
     }

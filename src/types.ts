@@ -160,6 +160,10 @@ export interface DAOStats {
   // chain is at Y" is the useful pair for gauging indexer lag.
   lastIndexedLedger: number | null
   observedTipLedger: number | null
+  /** Number of ledgers the indexer is behind the chain tip. null when unknown (cold start). */
+  ledgersBehind: number | null
+  /** Estimated wall-clock lag in seconds (ledgersBehind * ~5s). null when unknown. */
+  estimatedLagSeconds: number | null
   secondsSinceUpdate: number | null
   indexerStale: boolean
 }
