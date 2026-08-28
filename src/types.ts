@@ -114,6 +114,22 @@ export interface EventRow {
   created_at: string
 }
 
+/** One event on a per-entity timeline (issue #26): a raw `events` row decoded
+ *  into its named fields via the `EVENT_FIELDS` catalog, so a client reads
+ *  `fields.amount` instead of re-deriving the data tuple's shape. */
+export interface TimelineEntry {
+  /** Soroban event paging id (globally unique, encodes ledger + index). */
+  id: string
+  /** First topic, e.g. `loan_vote`. */
+  symbol: string
+  ledger: number
+  /** Ledger close time (ISO 8601). */
+  timestamp: string
+  tx_hash: string | null
+  /** Named view of the event's data tuple; `{}` for an uncatalogued symbol. */
+  fields: Record<string, unknown>
+}
+
 export interface InterestDistributionRow {
   id: number
   ledger: number

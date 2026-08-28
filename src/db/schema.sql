@@ -58,6 +58,17 @@ CREATE INDEX IF NOT EXISTS events_ledger_idx ON events (ledger);
 -- a database that has held more than one CONTRACT_ID can be read per
 -- deployment (issue #16).
 CREATE INDEX IF NOT EXISTS events_contract_id_idx ON events (contract_id);
+-- Per-entity timelines (issue #26). Every loan- and treasury-lifecycle event
+-- carries its entity id as the first `data` tuple entry (data->>0) — see
+-- LOAN_TIMELINE_SYMBOLS / TREASURY_TIMELINE_SYMBOLS in src/stellar/events.ts
+-- — so a btree expression index on that extracted value turns
+-- `GET /api/loans/:id/timeline` into an index scan over the handful of
+-- matching rows instead of a seq scan of the whole log. EXPLAIN output on a
+-- seeded dataset is in the PR.
+CREATE INDEX IF NOT EXISTS events_entity_id_idx ON events ((data->>0));
+-- Supports `GET /api/members/:address/activity`, which matches an address in
+-- any position of the `data` tuple with JSONB containment (`data @> '"G…"'`).
+CREATE INDEX IF NOT EXISTS events_data_gin_idx ON events USING GIN (data jsonb_path_ops);
 
 CREATE TABLE IF NOT EXISTS members (
   address         TEXT PRIMARY KEY,
