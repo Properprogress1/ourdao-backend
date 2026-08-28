@@ -105,6 +105,7 @@ export async function migrate(): Promise<void> {
 }
 
 // Allow running directly: `npm run migrate`.
+/* v8 ignore start -- run-directly entrypoint, exercised as a subprocess not by vitest (#79) */
 if (import.meta.url === `file://${process.argv[1]}`) {
   migrate()
     .then(() => {
@@ -116,3 +117,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       process.exit(1)
     })
 }
+/* v8 ignore stop */

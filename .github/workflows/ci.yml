@@ -45,8 +45,135 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      - name: Test
-        run: npm test
+      # Runs the full suite with v8 coverage instrumentation and enforces the
+      # thresholds in vitest.config.ts (#79). Replaces the plain `npm test`
+      # step — same tests, plus the report. Observed runtime delta on CI: a
+      # few seconds (instrumentation only; the suite already runs once).
+      - name: Test + coverage
+        run: npm run test:coverage
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            {
+              echo '### Coverage'
+              echo ''
+              echo '| metric | % | covered / total |'
+              echo '| --- | --- | --- |'
+              node -e '
+                const t = require("./coverage/coverage-summary.json").total;
+                for (const k of ["lines","statements","functions","branches"])
+                  console.log(`| ${k} | ${t[k].pct}% | ${t[k].covered} / ${t[k].total} |`);
+              '
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Build
         run: npm run build
+
+  # #76 — the deployment artifact (the container image) was the one output
+  # with no automated verification. Independent job so a failure here is
+  # attributable at a glance and doesn't block the source gates.
+  docker-build:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ourdao
+          POSTGRES_PASSWORD: ourdao
+          POSTGRES_DB: ourdao_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ourdao"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_URL: postgres://ourdao:ourdao@localhost:5432/ourdao_test
+      IMAGE: ourdao-backend:ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      # The `cp src/db/schema.sql … && cp -r src/db/migrations …` build step is
+      # the failure most likely to reach production silently: add a migration,
+      # forget the copy, image starts and dies at runtime while CI is green.
+      - name: dist/ contains schema.sql, migrations/, and both entrypoints
+        run: |
+          docker run --rm --entrypoint sh "$IMAGE" -c '
+            set -e
+            test -s dist/db/schema.sql
+            test -d dist/db/migrations
+            [ -n "$(ls -A dist/db/migrations)" ]
+            test -f dist/index.js
+            test -f dist/worker.js
+          '
+
+      # A dependency wrongly placed in devDependencies breaks the runtime
+      # stage (npm ci --omit=dev) and nothing else — assert the app actually
+      # loads with only production deps installed.
+      - name: production dependency tree resolves
+        run: docker run --rm --entrypoint node "$IMAGE" -e "require('fastify'); require('pg'); require('@stellar/stellar-sdk')"
+
+      - name: runs as the non-root 'node' user
+        run: |
+          got="$(docker run --rm --entrypoint id "$IMAGE" -un)"
+          echo "user: $got"
+          test "$got" = node
+
+      - name: HEALTHCHECK binary (wget) is present
+        run: docker run --rm --entrypoint sh "$IMAGE" -c 'command -v wget'
+
+      - name: image labels are populated from build args
+        run: |
+          rev="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE")"
+          echo "revision label: $rev"
+          test "$rev" = "${{ github.sha }}"
+
+      - name: API entrypoint boots and the HEALTHCHECK reports healthy
+        run: |
+          docker run -d --name api --network host \
+            --health-interval=3s --health-start-period=3s --health-retries=10 \
+            -e DATABASE_URL="$DB_URL" -e PORT=4000 -e CONTRACT_ID=CTEST "$IMAGE"
+          for _ in $(seq 1 40); do
+            s="$(docker inspect -f '{{.State.Health.Status}}' api)"
+            [ "$s" = healthy ] && break
+            [ "$s" = unhealthy ] && break
+            sleep 2
+          done
+          echo "--- api logs ---"; docker logs api
+          curl -fsS -o /dev/null -w 'GET /health -> %{http_code}\n' http://localhost:4000/health
+          docker rm -f api >/dev/null
+          test "$s" = healthy
+
+      - name: worker entrypoint boots and exits 0 on SIGTERM
+        run: |
+          docker run -d --name worker --network host \
+            -e DATABASE_URL="$DB_URL" -e CONTRACT_ID=CTEST \
+            "$IMAGE" node dist/worker.js
+          sleep 10
+          echo "--- worker logs ---"; docker logs worker
+          docker stop -t 15 worker
+          code="$(docker inspect -f '{{.State.ExitCode}}' worker)"
+          echo "worker exit code: $code"
+          docker rm -f worker >/dev/null
+          test "$code" = 0

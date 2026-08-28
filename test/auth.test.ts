@@ -1,12 +1,22 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Account, Keypair, MuxedAccount, StrKey } from '@stellar/stellar-sdk'
 import {
   authenticateRequest,
   classifyStellarAddress,
+  extractAuthHeaders,
+  isValidStellarAddress,
   verifySignature,
   MemoryNonceStore,
   type NonceStore,
 } from '../src/auth.js'
+
+// Direct coverage for the whole auth/authz surface (#72). Pure logic, no
+// database. Real Keypair.random() keys and real signatures throughout, never
+// mocked verification. The classifyStellarAddress / verifySignature (#71) and
+// authenticateRequest (#70) blocks below landed with those issues; #72 adds
+// MemoryNonceStore, extractAuthHeaders, isValidStellarAddress, and the
+// characterization cases that pin exact behaviour (including anything that
+// looks off — noted, not fixed).
 
 const keypair = Keypair.random()
 const G = keypair.publicKey()
@@ -115,5 +125,174 @@ describe('authenticateRequest (issue #70)', () => {
     const other = Keypair.random().publicKey()
     const res = await authenticateRequest(headersFor(G), alwaysValidNonce, other)
     expect(res).toMatchObject({ authenticated: false, status: 401 })
+  })
+})
+
+describe('MemoryNonceStore (#72)', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('issue() returns a distinct 64-hex value per call and per address', async () => {
+    const store = new MemoryNonceStore()
+    const a1 = await store.issue('GA')
+    const a2 = await store.issue('GA')
+    const b1 = await store.issue('GB')
+    for (const n of [a1, a2, b1]) expect(n).toMatch(/^[0-9a-f]{64}$/)
+    expect(new Set([a1, a2, b1]).size).toBe(3)
+    await store.shutdown()
+  })
+
+  it('consume() succeeds exactly once for a valid (address, nonce) pair', async () => {
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(G)
+    expect(await store.consume(G, nonce)).toBe(true)
+    expect(await store.consume(G, nonce)).toBe(false)
+    await store.shutdown()
+  })
+
+  it('consume() fails for the wrong nonce and for an unknown address', async () => {
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(G)
+    expect(await store.consume(G, 'not-the-nonce')).toBe(false)
+    expect(await store.consume('GUNKNOWN', nonce)).toBe(false)
+    await store.shutdown()
+  })
+
+  it("consume() rejects address A's nonce presented for address B", async () => {
+    const store = new MemoryNonceStore()
+    const nonceForA = await store.issue('GA')
+    expect(await store.consume('GB', nonceForA)).toBe(false)
+    await store.shutdown()
+  })
+
+  it('an entry past its 5-minute TTL fails on consume — expiry is evaluated at consume time', async () => {
+    vi.useFakeTimers()
+    const store = new MemoryNonceStore()
+    await store.shutdown() // stop the periodic sweep so `consume` is what detects expiry
+    const nonce = await store.issue(G)
+    vi.advanceTimersByTime(5 * 60 * 1000 + 1)
+    expect(await store.consume(G, nonce)).toBe(false)
+  })
+
+  it('the periodic sweep evicts expired entries without a consume call', async () => {
+    vi.useFakeTimers()
+    const store = new MemoryNonceStore()
+    await store.issue(G)
+    vi.advanceTimersByTime(6 * 60 * 1000) // sweep runs every 60s; entry expires at 300s
+    const internal = (store as unknown as { store: Map<string, unknown> }).store
+    expect(internal.size).toBe(0)
+    await store.shutdown()
+  })
+})
+
+describe('extractAuthHeaders (#72)', () => {
+  const NULLS = { address: null, signature: null, nonce: null }
+
+  it('returns nulls for an absent header', () => {
+    expect(extractAuthHeaders({})).toEqual(NULLS)
+  })
+
+  it('returns nulls for a non-string header', () => {
+    expect(extractAuthHeaders({ authorization: 12345 })).toEqual(NULLS)
+  })
+
+  it('returns nulls for the wrong scheme prefix', () => {
+    expect(extractAuthHeaders({ authorization: 'Bearer abc:def:ghi' })).toEqual(NULLS)
+  })
+
+  it('returns nulls for too few colon-separated parts', () => {
+    expect(extractAuthHeaders({ authorization: 'StellarSignature addr:sig' })).toEqual(NULLS)
+  })
+
+  it('returns nulls for too many colon-separated parts', () => {
+    expect(extractAuthHeaders({ authorization: 'StellarSignature a:b:c:d' })).toEqual(NULLS)
+  })
+
+  it('parses a well-formed header into its three components', () => {
+    expect(extractAuthHeaders({ authorization: 'StellarSignature GABC:c2ln:n0nce' })).toEqual({
+      address: 'GABC',
+      signature: 'c2ln',
+      nonce: 'n0nce',
+    })
+  })
+
+  it('pins current behaviour: empty components come back as empty strings, not null', () => {
+    expect(extractAuthHeaders({ authorization: 'StellarSignature ::' })).toEqual({
+      address: '',
+      signature: '',
+      nonce: '',
+    })
+  })
+})
+
+describe('isValidStellarAddress (#72)', () => {
+  it('accepts a real G-address and rejects junk and non-ed25519 strkeys', () => {
+    expect(isValidStellarAddress(G)).toBe(true)
+    expect(isValidStellarAddress('not-an-address')).toBe(false)
+    expect(isValidStellarAddress(C)).toBe(false)
+  })
+})
+
+describe('authenticateRequest — characterization (#72)', () => {
+  function headersFor(address: string, nonce: string): Record<string, unknown> {
+    return { authorization: `StellarSignature ${address}:${sign(nonce, address)}:${nonce}` }
+  }
+
+  it('authenticates a request with a real nonce and signature', async () => {
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(G)
+    expect(await authenticateRequest(headersFor(G, nonce), store)).toEqual({
+      authenticated: true,
+      address: G,
+    })
+    await store.shutdown()
+  })
+
+  it('returns the exact client-facing error string for each failure', async () => {
+    expect(await authenticateRequest({}, alwaysValidNonce)).toMatchObject({
+      error: 'Missing authentication headers',
+    })
+    expect(
+      await authenticateRequest(headersFor(G, 'n'), { issue: async () => 'n', consume: async () => false }),
+    ).toMatchObject({ error: 'Invalid or expired nonce' })
+    expect(
+      await authenticateRequest({ authorization: `StellarSignature ${G}:bm90LXNpZw:n` }, alwaysValidNonce),
+    ).toMatchObject({ error: 'Invalid signature' })
+
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(G)
+    expect(
+      await authenticateRequest(headersFor(G, nonce), store, Keypair.random().publicKey()),
+    ).toMatchObject({ error: 'Cannot modify notifications for another address' })
+    await store.shutdown()
+  })
+
+  // The actual authorization control: one member cannot act on another's data.
+  // Deleting the `if (targetAddress && targetAddress !== address)` block in
+  // src/auth.ts makes this test return `{ authenticated: true, address: G }`.
+  it('rejects a targetAddress that is not the authenticated address', async () => {
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(G)
+    const res = await authenticateRequest(headersFor(G, nonce), store, Keypair.random().publicKey())
+    expect(res).toEqual({
+      authenticated: false,
+      status: 401,
+      error: 'Cannot modify notifications for another address',
+    })
+    await store.shutdown()
+  })
+
+  it('pins current ordering: the nonce is consumed before the signature check, so a bad-signature request still spends its nonce', async () => {
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(G)
+    const first = await authenticateRequest(
+      { authorization: `StellarSignature ${G}:bm90LXNpZw:${nonce}` },
+      store,
+    )
+    expect(first).toMatchObject({ authenticated: false, error: 'Invalid signature' })
+    const second = await authenticateRequest(headersFor(G, nonce), store)
+    expect(second).toMatchObject({ authenticated: false, error: 'Invalid or expired nonce' })
+    await store.shutdown()
   })
 })
