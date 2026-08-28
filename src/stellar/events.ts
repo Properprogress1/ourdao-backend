@@ -52,6 +52,59 @@ export const EVENT_FIELDS = {
   unpaused: [],
 } as const
 
+/** Loan lifecycle event symbols, in the order a loan moves through them
+ *  (issue #26). For every one, the loan / proposal id is the *first* data
+ *  tuple entry — named `id` on `loan_req`/`loan_appr`, `proposal_id` on
+ *  `loan_edit`/`loan_vote`, `loan_id` on `loan_rpy`/`loan_dflt` — because
+ *  `loans.id == loan_proposals.id` is a contract invariant, so one id keys
+ *  the whole timeline. Consumed by `GET /api/loans/:id/timeline`, which
+ *  filters `events` on `data->>0`. */
+export const LOAN_TIMELINE_SYMBOLS = [
+  'loan_req',
+  'loan_edit',
+  'loan_vote',
+  'loan_appr',
+  'loan_rpy',
+  'loan_dflt',
+] as const
+
+/** Treasury proposal lifecycle event symbols (issue #26). The proposal id is
+ *  likewise the first data tuple entry on every one (`id` on `tre_prop`/
+ *  `tre_vote`/`tre_exec`, `proposal_id` on `committed`/`revealed`). Consumed
+ *  by `GET /api/proposals/treasury/:id/timeline`. */
+export const TREASURY_TIMELINE_SYMBOLS = [
+  'tre_prop',
+  'tre_vote',
+  'committed',
+  'revealed',
+  'tre_exec',
+] as const
+
+/** Event symbols that name a member address as a participant somewhere in
+ *  their data tuple (issue #26). The address position differs per symbol —
+ *  `data[0]` for `joined`/`staked`/…, `data[1]` for `loan_req`/`loan_vote`/…
+ *  — so `GET /api/members/:address/activity` matches with JSONB containment
+ *  (`data @> '"G…"'`) rather than a fixed offset, and restricts to this set
+ *  so an address that only appears as e.g. a treasury `destination` doesn't
+ *  register as member activity. */
+export const MEMBER_ACTIVITY_SYMBOLS = [
+  'joined',
+  'exited',
+  'claimed',
+  'staked',
+  'unstaked',
+  'name_reg',
+  'loan_req',
+  'loan_edit',
+  'loan_vote',
+  'loan_appr',
+  'loan_rpy',
+  'loan_dflt',
+  'tre_vote',
+  'committed',
+  'revealed',
+] as const
+
 /** Event symbols that represent governance/admin actions rather than DAO
  *  member activity. Used to power the admin audit log endpoint. */
 export const ADMIN_EVENT_SYMBOLS = [

@@ -2,7 +2,13 @@ import type { FastifyInstance } from 'fastify'
 import { StrKey } from '@stellar/stellar-sdk'
 import { query, queryOne } from '../../db/index.js'
 import { config } from '../../config.js'
-import { ADMIN_EVENT_SYMBOLS } from '../../stellar/events.js'
+import {
+  ADMIN_EVENT_SYMBOLS,
+  LOAN_TIMELINE_SYMBOLS,
+  TREASURY_TIMELINE_SYMBOLS,
+  MEMBER_ACTIVITY_SYMBOLS,
+  namedFields,
+} from '../../stellar/events.js'
 import type {
   DAOStats,
   LoanProposalRow,
@@ -15,6 +21,7 @@ import type {
   InterestDistributionRow,
   DocumentRow,
   FailedEventRow,
+  TimelineEntry,
 } from '../../types.js'
 import { authenticateRequest, isValidStellarAddress, type NonceStore } from '../../auth.js'
 
@@ -56,6 +63,52 @@ function invalidEventCursor(v: unknown): boolean {
 
 function validAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address)
+}
+
+// Validate a positive integer path param (loan / proposal id). Returns the
+// trimmed decimal string on success (kept as a string so it compares
+// directly against the JSONB-extracted `data->>0`), or null.
+function entityIdParam(v: string): string | null {
+  const raw = v.trim()
+  if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) <= 0) return null
+  return raw
+}
+
+// Decode one raw `events` row into a timeline entry (issue #26): named fields
+// via the EVENT_FIELDS catalog rather than the raw positional tuple, so a
+// client doesn't reimplement the decoder.
+function toTimelineEntry(row: EventRow): TimelineEntry {
+  const data = Array.isArray(row.data) ? (row.data as unknown[]) : []
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    ledger: row.ledger,
+    timestamp: row.closed_at,
+    tx_hash: row.tx_hash,
+    fields: namedFields(row.symbol, data),
+  }
+}
+
+// A single loan / treasury proposal produces a bounded lifecycle (a request,
+// an approval, an execution, and one vote per member), but "one vote per
+// member" is only bounded by the membership size — so cap the timeline query
+// defensively rather than leaving it unbounded. Comfortably above any real
+// DAO's per-proposal event count; a client that hits it can page /api/events.
+const TIMELINE_MAX_ROWS = 2000
+
+// Shared implementation for the two per-entity timeline endpoints. `symbols`
+// is the lifecycle set for the entity family; the id is matched against the
+// first `data` tuple entry (`data->>0`), which every symbol in these sets
+// carries — see LOAN_TIMELINE_SYMBOLS / TREASURY_TIMELINE_SYMBOLS.
+async function entityTimeline(symbols: readonly string[], id: string): Promise<TimelineEntry[]> {
+  const rows = await query<EventRow>(
+    `SELECT * FROM events
+       WHERE symbol = ANY($1) AND data->>0 = $2
+       ORDER BY ledger ASC, id ASC
+       LIMIT $3`,
+    [symbols as string[], id, TIMELINE_MAX_ROWS]
+  )
+  return rows.map(toTimelineEntry)
 }
 
 // A loan's interest charge and repayment progress aren't stored columns —
@@ -198,6 +251,38 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     return result
   })
 
+  // --- A member's cross-entity activity feed (issue #26) ---
+  // The obvious sibling of the per-loan / per-proposal timelines: every event
+  // that names this address as a participant, newest first, across joins,
+  // stakes, loans and votes. Matches the address in any position of the
+  // JSONB `data` tuple (it sits at a different offset per symbol) and
+  // restricts to MEMBER_ACTIVITY_SYMBOLS so an address that only appears as
+  // e.g. a treasury `destination` doesn't show up here. `?before=<ledger>`
+  // cursor, like the other historical feeds.
+  app.get<{ Params: { address: string } }>('/members/:address/activity', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    if (!validAddress(req.params.address)) {
+      return reply.code(400).send({ error: 'invalid Stellar address' })
+    }
+    const q = req.query as Record<string, unknown>
+    const l = limit(q.limit)
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+
+    const params: unknown[] = [MEMBER_ACTIVITY_SYMBOLS as unknown as string[], req.params.address]
+    let where = `WHERE symbol = ANY($1) AND data @> to_jsonb($2::text)`
+    if (before !== null) {
+      params.push(before)
+      where += ` AND ledger < $${params.length}`
+    }
+    params.push(l)
+    const rows = await query<EventRow>(
+      `SELECT * FROM events ${where} ORDER BY ledger DESC, id DESC LIMIT $${params.length}`,
+      params
+    )
+    return { activity: rows.map(toTimelineEntry) }
+  })
+
   // --- Loan proposals ---
   app.get('/proposals/loan', async (req, reply) => {
     reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
@@ -241,11 +326,41 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     return withLoanDerived(loan)
   })
 
+  // --- A loan's full event history (issue #26) ---
+  // Every state change to a loan — requested, edited, voted on, approved,
+  // repaid or defaulted — is in the raw event log already, but reconstructing
+  // it meant paging the whole `/api/events` feed and filtering client-side on
+  // an id buried in the JSONB `data` column. This is the query on-chain state
+  // can't answer (the contract keeps no queryable history) and this service
+  // exists for. `loans.id == loan_proposals.id` by contract invariant, so one
+  // id covers the whole lifecycle. A nonexistent id returns an empty timeline
+  // (200), not a 404 — the loan may simply have no events yet, and the caller
+  // asked "what happened to this id", which is legitimately "nothing".
+  app.get<{ Params: { id: string } }>('/loans/:id/timeline', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    const id = entityIdParam(req.params.id)
+    if (id === null) return reply.code(400).send({ error: 'invalid loan id' })
+    return { timeline: await entityTimeline(LOAN_TIMELINE_SYMBOLS, id) }
+  })
+
   // --- Treasury proposals ---
   app.get('/proposals/treasury', async (req, reply) => {
     reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const l = limit((req.query as Record<string, unknown>).limit)
     return query<TreasuryProposalRow>('SELECT * FROM treasury_proposals ORDER BY id DESC LIMIT $1', [l])
+  })
+
+  // --- A treasury proposal's full event history (issue #26) ---
+  // The treasury-lifecycle equivalent of `/loans/:id/timeline`: proposed,
+  // voted on, committed and revealed (the commit–reveal path for private
+  // proposals), executed. Loan and treasury proposal ids are drawn from
+  // independent sequences and collide, so this is a distinct route rather
+  // than a shared `/proposals/:id/timeline`. Same empty-not-404 contract.
+  app.get<{ Params: { id: string } }>('/proposals/treasury/:id/timeline', async (req, reply) => {
+    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    const id = entityIdParam(req.params.id)
+    if (id === null) return reply.code(400).send({ error: 'invalid proposal id' })
+    return { timeline: await entityTimeline(TREASURY_TIMELINE_SYMBOLS, id) }
   })
 
   // --- Notifications for an address ---
