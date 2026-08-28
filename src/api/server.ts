@@ -16,6 +16,7 @@ export async function buildServer(): Promise<FastifyInstance> {
     logger: { level: process.env.LOG_LEVEL ?? 'info' },
     trustProxy: config.http.trustProxy === 'true',
   })
+  const nonceStore = new MemoryNonceStore()
 
   // ── CORS ──
   const origins = config.http.corsOrigin
@@ -37,7 +38,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   })
 
   // ── Routes ──
-  await app.register(registerRoutes, { prefix: '/api' })
+  await app.register(registerRoutes, { prefix: '/api', nonceStore })
 
   // ── Liveness probe (issue #2) — no DB round trip ──
   app.get('/health', async () => ({ status: 'ok', contract: config.stellar.contractId || null }))
