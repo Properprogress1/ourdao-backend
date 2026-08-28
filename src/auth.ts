@@ -1,4 +1,4 @@
-import { Keypair, StrKey } from '@stellar/stellar-sdk'
+import { Keypair, StrKey, MuxedAccount } from '@stellar/stellar-sdk'
 import { randomBytes } from 'crypto'
 import type { Pool } from 'pg'
 
@@ -99,6 +99,7 @@ export class PostgresNonceStore implements NonceStore {
         )
       } catch (error) {
         // Log but don't throw - cleanup failure shouldn't crash the process
+        console.warn(`[auth] expired-nonce cleanup failed: ${(error as Error).message}`)
       }
     }, 10 * 60 * 1000) // Every 10 minutes
     // Unref the timer so it doesn't prevent graceful shutdown
@@ -144,24 +145,87 @@ export class PostgresNonceStore implements NonceStore {
   }
 }
 
+/** The Stellar address families the auth path can encounter. */
+export type StellarAddressType = 'ed25519' | 'muxed' | 'contract' | 'invalid'
+
+export function classifyStellarAddress(address: string): StellarAddressType {
+  if (StrKey.isValidEd25519PublicKey(address)) return 'ed25519'
+  if (StrKey.isValidMed25519PublicKey(address)) return 'muxed'
+  if (StrKey.isValidContract(address)) return 'contract'
+  return 'invalid'
+}
+
+/**
+ * Result of {@link verifySignature}. A failure carries the HTTP status the
+ * caller should use and a client-safe message — an *unsupported address type*
+ * is a 400 with an accurate reason, not a 401 "Invalid signature" (issue #71).
+ * Failure-mode detail is written to the log, never returned here.
+ */
+export type SignatureResult =
+  | { ok: true; ed25519Address: string }
+  | { ok: false; status: 400 | 401; error: string }
+
+const ED25519_SIGNATURE_BYTES = 64
+
 export function verifySignature(
   address: string,
   nonce: string,
   signature: string
-): boolean {
+): SignatureResult {
+  const type = classifyStellarAddress(address)
+
+  if (type === 'invalid') {
+    return { ok: false, status: 400, error: 'Unrecognized Stellar address format' }
+  }
+
+  // Contract (C…) accounts authorize through the contract's `__check_auth`,
+  // which requires an on-chain RPC call to verify — they cannot produce an
+  // ed25519 signature at all. Unsupported here; see README "Security notes".
+  // Follow-up for `__check_auth` verification: tracked separately.
+  if (type === 'contract') {
+    return {
+      ok: false,
+      status: 400,
+      error: 'Contract (C…) accounts are not supported for authentication',
+    }
+  }
+
+  // Muxed (M…) accounts wrap an underlying G… account that holds the signing
+  // key — resolve to it and verify against that key. The signed payload still
+  // uses the address exactly as presented in the header.
+  let ed25519Address = address
+  if (type === 'muxed') {
+    try {
+      ed25519Address = MuxedAccount.fromAddress(address, '0').baseAccount().accountId()
+    } catch (error) {
+      console.warn(`[auth] could not resolve muxed address ${address}: ${(error as Error).message}`)
+      return { ok: false, status: 400, error: 'Malformed muxed (M…) address' }
+    }
+  }
+
+  // Buffer.from(_, 'base64') never throws — it silently drops invalid
+  // characters — so a wrong-length result is how a malformed encoding shows
+  // up. An ed25519 signature is exactly 64 bytes; anything else is a bad
+  // encoding, logged distinctly from a valid-but-wrong signature.
+  const signatureBuffer = Buffer.from(signature, 'base64')
+  if (signatureBuffer.length !== ED25519_SIGNATURE_BYTES) {
+    console.warn(
+      `[auth] signature for ${address} decoded to ${signatureBuffer.length} bytes (expected ${ED25519_SIGNATURE_BYTES}) — malformed base64`
+    )
+    return { ok: false, status: 401, error: 'Invalid signature' }
+  }
+
+  const data = Buffer.from(`${nonce}:${address}`, 'utf8')
   try {
-    // Create the data that was signed: nonce + address for context
-    const data = Buffer.from(`${nonce}:${address}`, 'utf8')
-    
-    // Convert signature from base64
-    const signatureBuffer = Buffer.from(signature, 'base64')
-    
-    // Verify using Stellar's Keypair.verify
-    const keypair = Keypair.fromPublicKey(address)
-    return keypair.verify(data, signatureBuffer)
-  } catch {
-    // Any error means invalid signature
-    return false
+    const keypair = Keypair.fromPublicKey(ed25519Address)
+    if (!keypair.verify(data, signatureBuffer)) {
+      console.warn(`[auth] signature verification failed for ${address} (well-formed, wrong signature or key)`)
+      return { ok: false, status: 401, error: 'Invalid signature' }
+    }
+    return { ok: true, ed25519Address }
+  } catch (error) {
+    console.warn(`[auth] unexpected error verifying signature for ${address}: ${(error as Error).message}`)
+    return { ok: false, status: 401, error: 'Invalid signature' }
   }
 }
 
@@ -200,34 +264,44 @@ export function isValidStellarAddress(address: string): boolean {
   }
 }
 
+/**
+ * Result of {@link authenticateRequest}. A discriminated union so the type
+ * checker refuses `result.address` unless `authenticated` is `true` — an
+ * authorization check can only ever compare against the address that was
+ * actually authenticated, never a separately re-parsed one (issue #70).
+ */
+export type AuthResult =
+  | { authenticated: false; status: number; error: string }
+  | { authenticated: true; address: string }
+
 // Authentication middleware function
 export async function authenticateRequest(
   headers: Record<string, unknown>,
   nonceStore: NonceStore,
   targetAddress?: string
-): Promise<{ authenticated: boolean; error?: string }> {
+): Promise<AuthResult> {
   const { address, signature, nonce } = extractAuthHeaders(headers)
-  
+
   if (!address || !signature || !nonce) {
-    return { authenticated: false, error: 'Missing authentication headers' }
+    return { authenticated: false, status: 401, error: 'Missing authentication headers' }
   }
 
   // Check if the nonce is valid and hasn't been used
   const nonceValid = await nonceStore.consume(address, nonce)
   if (!nonceValid) {
-    return { authenticated: false, error: 'Invalid or expired nonce' }
+    return { authenticated: false, status: 401, error: 'Invalid or expired nonce' }
   }
 
   // Verify the signature
-  const signatureValid = verifySignature(address, nonce, signature)
-  if (!signatureValid) {
-    return { authenticated: false, error: 'Invalid signature' }
+  const sig = verifySignature(address, nonce, signature)
+  if (!sig.ok) {
+    return { authenticated: false, status: sig.status, error: sig.error }
   }
 
   // If a target address is provided, ensure it matches the authenticated address
   if (targetAddress && targetAddress !== address) {
-    return { authenticated: false, error: 'Cannot modify notifications for another address' }
+    return { authenticated: false, status: 401, error: 'Cannot modify notifications for another address' }
   }
 
-  return { authenticated: true }
+  return { authenticated: true, address }
 }

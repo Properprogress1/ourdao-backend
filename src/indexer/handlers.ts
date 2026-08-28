@@ -1,6 +1,6 @@
 import type { PoolClient } from 'pg'
-import type { DecodedEvent } from '../stellar/events.js'
-import { notifyStreamClients, STREAM_CHANNELS } from '../api/stream.js'
+import { isKnownSymbol, warnUnknownSymbol, type DecodedEvent } from '../stellar/events.js'
+import { notifyStreamClients, STREAM_CHANNELS, type StreamChannel } from '../api/stream.js'
 import type { NotificationType } from '../types.js'
 
 // Helpers ------------------------------------------------------------------
@@ -520,12 +520,17 @@ const handlers: Record<string, Handler> = {
 /** Apply one decoded event's side effects. Unknown symbols are a no-op
  *  (the raw event is still persisted by the caller). */
 export async function applyEvent(client: PoolClient, ev: DecodedEvent): Promise<void> {
+  // A symbol the catalog doesn't know is a deliberate no-op (raw event already
+  // stored by the caller) — but announce it once so a new contract event
+  // can't quietly leave derived state incomplete (issue #39).
+  if (!isKnownSymbol(ev.symbol)) warnUnknownSymbol(ev)
+
   const handler = handlers[ev.symbol]
   if (handler) await handler(client, ev)
 
   // Emit NOTIFY for stream subscribers (issue #63)
   // Map event symbols to stream channels
-  const channelMap: Record<string, string> = {
+  const channelMap: Record<string, StreamChannel> = {
     joined: STREAM_CHANNELS.members,
     exited: STREAM_CHANNELS.members,
     staked: STREAM_CHANNELS.members,
@@ -551,7 +556,7 @@ export async function applyEvent(client: PoolClient, ev: DecodedEvent): Promise<
 
   const channel = channelMap[ev.symbol]
   if (channel) {
-    await notifyStreamClients(client, channel as any, {
+    await notifyStreamClients(client, channel, {
       symbol: ev.symbol,
       ledger: ev.ledger,
       timestamp: Date.now(),

@@ -16,7 +16,7 @@ import type {
   DocumentRow,
   FailedEventRow,
 } from '../../types.js'
-import { authenticateRequest, isValidStellarAddress, extractAuthHeaders, type NonceStore } from '../../auth.js'
+import { authenticateRequest, isValidStellarAddress, type NonceStore } from '../../auth.js'
 
 // Small helper: clamp a `limit` query param to a sane range.
 function limit(v: unknown, def = 50, max = 200): number {
@@ -342,24 +342,24 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     // First authenticate the request
     const auth = await authenticateRequest(req.headers, nonceStore)
     if (!auth.authenticated) {
-      return reply.code(401).send({ error: auth.error || 'Authentication required' })
+      return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
     }
-    
+
     const id = Number(req.params.id)
     if (!Number.isFinite(id)) {
       return reply.code(400).send({ error: 'invalid notification id' })
     }
-    
+
     // Get the notification to check ownership
     const notification = await queryOne<NotificationRow>(
       'SELECT * FROM notifications WHERE id = $1',
       [id]
     )
     if (!notification) return reply.code(404).send({ error: 'notification not found' })
-    
-    // Extract address from auth headers and verify ownership
-    const { address: authAddress } = extractAuthHeaders(req.headers)
-    if (notification.address !== authAddress) {
+
+    // Ownership check uses the address `authenticateRequest` proved control
+    // of — never a second parse of the raw header (issue #70).
+    if (notification.address !== auth.address) {
       return reply.code(403).send({ error: 'Cannot modify notifications for another address' })
     }
     
@@ -381,7 +381,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     // Authenticate the request and verify the address matches
     const auth = await authenticateRequest(req.headers, nonceStore, q.address)
     if (!auth.authenticated) {
-      return reply.code(401).send({ error: auth.error || 'Authentication required' })
+      return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
     }
     
     const rows = await query<NotificationRow>(
