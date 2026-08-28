@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { pool } from '../src/db/index.js'
+import { DERIVED_TABLES } from '../src/indexer/derived-tables.js'
 
 const schemaPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/db/schema.sql')
 
@@ -21,25 +22,17 @@ export function ensureSchema(): Promise<void> {
   return schemaApplied
 }
 
-// Order doesn't matter — TRUNCATE ... CASCADE handles dependents, and none of
-// these tables actually have FK constraints between them (each is keyed by
-// address/id independently, matching schema.sql).
-const TABLES = [
-  'notifications',
-  'treasury_proposals',
-  'loans',
-  'loan_proposals',
-  'members',
+// Non-derived tables that must also be truncated between tests.
+const NON_DERIVED_TABLES = [
   'events',
   'indexer_cursor',
-  'interest_distributions',
-  'documents',
   'failed_events',
 ]
 
 export async function resetDb(): Promise<void> {
   await ensureSchema()
-  await pool.query(`TRUNCATE ${TABLES.join(', ')} RESTART IDENTITY CASCADE`)
+  const allTables = [...DERIVED_TABLES, ...NON_DERIVED_TABLES]
+  await pool.query(`TRUNCATE ${allTables.join(', ')} RESTART IDENTITY CASCADE`)
   // dao_totals is a fixed singleton — reset its values in place and make sure
   // the row exists (schema.sql seeds it, but be defensive against a partial
   // apply during test bootstrap).

@@ -109,6 +109,8 @@ export async function buildServer(): Promise<FastifyInstance> {
         indexer: 'cold_start',
         lastIndexedLedger: null,
         observedTipLedger: row?.observed_tip_ledger ?? null,
+        ledgersBehind: null,
+        estimatedLagSeconds: null,
         secondsSinceUpdate: null,
       })
     }
@@ -116,13 +118,21 @@ export async function buildServer(): Promise<FastifyInstance> {
     const updatedAt = new Date(row.updated_at!).getTime()
     const secondsSinceUpdate = Math.floor((Date.now() - updatedAt) / 1000)
     const isStale = Date.now() - updatedAt > config.indexer.staleAfterMs
+    const lastLedger = row.last_ledger
+    const tipLedger = row.observed_tip_ledger
+    const ledgersBehind = lastLedger != null && tipLedger != null && tipLedger > lastLedger
+      ? tipLedger - lastLedger
+      : null
+    const estimatedLagSeconds = ledgersBehind != null ? ledgersBehind * 5 : null
 
     if (isStale) {
       return reply.code(503).send({
         status: 'not ready',
         reason: 'indexer_stale',
-        lastIndexedLedger: row.last_ledger,
-        observedTipLedger: row.observed_tip_ledger,
+        lastIndexedLedger: lastLedger,
+        observedTipLedger: tipLedger,
+        ledgersBehind,
+        estimatedLagSeconds,
         secondsSinceUpdate,
         staleAfterMs: config.indexer.staleAfterMs,
       })
@@ -131,8 +141,10 @@ export async function buildServer(): Promise<FastifyInstance> {
     return reply.code(200).send({
       status: 'ready',
       indexer: 'ok',
-      lastIndexedLedger: row.last_ledger,
-      observedTipLedger: row.observed_tip_ledger,
+      lastIndexedLedger: lastLedger,
+      observedTipLedger: tipLedger,
+      ledgersBehind,
+      estimatedLagSeconds,
       secondsSinceUpdate,
     })
   })

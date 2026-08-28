@@ -2,6 +2,7 @@ import type { PoolClient } from 'pg'
 import { pool } from '../db/index.js'
 import { applyEvent } from './handlers.js'
 import { namedFields, type DecodedEvent } from '../stellar/events.js'
+import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
 
 interface EventLogRow {
   id: string
@@ -13,19 +14,6 @@ interface EventLogRow {
   data: unknown
   tx_hash: string | null
 }
-
-// Everything derived from the raw `events` log. `events`, `schema_migrations`
-// and `indexer_cursor` are deliberately not touched — the point is to rebuild
-// derived state *from* the untouched raw log.
-const DERIVED_TABLES = [
-  'notifications',
-  'treasury_proposals',
-  'loans',
-  'loan_proposals',
-  'members',
-  'interest_distributions',
-  'documents',
-] as const
 
 /**
  * Rebuild every derived table from the raw `events` log (issue #23).
@@ -44,13 +32,7 @@ export async function reindexFromEventLog(): Promise<{ events: number }> {
   try {
     await client.query('BEGIN')
     await client.query(`TRUNCATE ${DERIVED_TABLES.join(', ')} RESTART IDENTITY`)
-    // dao_totals is a fixed single row — reset in place rather than truncate.
-    await client.query(
-      `UPDATE dao_totals
-          SET interest_collected = 0, principal_lent = 0,
-              principal_repaid = 0, value_defaulted = 0, updated_at = now()
-        WHERE id = 1`
-    )
+    await resetDaoTotals(client)
 
     const { rows } = await client.query<EventLogRow>(
       `SELECT id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash
