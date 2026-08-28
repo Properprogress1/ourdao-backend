@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import cors from '@fastify/cors'
 import rateLimit from '@fastify/rate-limit'
+import etag from '@fastify/etag'
 import { config } from '../config.js'
 import { pool } from '../db/index.js'
 import { registerRoutes } from './routes/index.js'
@@ -18,6 +19,8 @@ export async function buildServer(): Promise<FastifyInstance> {
     trustProxy: config.http.trustProxy === 'true',
   })
   const nonceStore = new MemoryNonceStore()
+
+  await app.register(etag)
 
   // ── CORS ──
   const origins = config.http.corsOrigin

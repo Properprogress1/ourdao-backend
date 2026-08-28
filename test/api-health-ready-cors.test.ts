@@ -116,11 +116,11 @@ describe('API: /api/stats includes freshness', () => {
 
   it('GET /api/stats reports stale when cursor is old', async () => {
     await query(
-      `INSERT INTO indexer_cursor (id, last_ledger, updated_at) VALUES (1, 500, now() - interval '10 minutes')`
+      `INSERT INTO indexer_cursor (id, last_ledger, updated_at) VALUES (1, 500, now() - interval '3 minutes')`
     )
     const res = await app.inject({ method: 'GET', url: '/api/stats' })
     const body = res.json()
     expect(body.indexerStale).toBe(true)
-    expect(body.secondsSinceUpdate).toBeGreaterThanOrEqual(600)
+    expect(body.secondsSinceUpdate).toBeGreaterThanOrEqual(180)
   })
 })

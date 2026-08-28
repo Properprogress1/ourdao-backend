@@ -184,6 +184,7 @@ Base path: `/api`.
 | `GET /api/interest` | Interest-distribution history — one row per `interest` event (`amount` collected, `active_members` at that distribution). `?before=<ledger>` cursor. |
 | `GET /api/members` | Active members. |
 | `GET /api/members/:address` | Single member. |
+| `GET /api/members/:address/summary` | Member's dashboard data, including the member row, up to 100 loans, unread notification count, and their relative position to DAO totals (share percentages in basis points) in a single consistent snapshot. |
 | `GET /api/proposals/loan` | Loan proposals with stake-weighted vote tallies (`votes_for`/`votes_against`) and a distinct `voter_count`. |
 | `GET /api/loans` | Loans. Optional `?borrower=`, `?before=<id>` for pagination. `status` is `active`, `repaid`, or `defaulted` — a loan is marked defaulted once it's past due plus the policy's grace period (permissionless on-chain, see `ourdao-contracts`). Each loan includes derived `interest_charge` and `repaid_amount` fields. |
 | `GET /api/loans/:id` | Single loan, with the same derived `interest_charge`/`repaid_amount` fields. |
@@ -191,12 +192,19 @@ Base path: `/api`.
 | `GET /api/notifications?address=` | Notifications for an address. |
 | `PATCH /api/notifications/:id/read` | Mark one notification read. |
 | `PATCH /api/notifications/read-all?address=` | Mark every unread notification for an address read. |
-| `GET /api/events` | Raw event feed. Optional `?symbol=`, `?before=<ledger>`. |
+| `GET /api/events` | Raw event feed. Optional `?symbol=`, `?before=<id|ledger>`, `?after=<id|ledger>`, `?order=asc|desc`. |
 | `GET /api/admin/log` | Admin/governance audit trail — init, admin add/remove, threshold changes, policy changes, pause/unpause. |
 | `GET /api/documents?kind=&proposal_id=` | A proposal's attached-document history (issue #44) — existence/history only, never the content hash (still read live from the contract via `get_document`). `kind` (`loan` or `treasury`) and `proposal_id` are both required, since loan and treasury proposal ids are drawn from independent sequences and collide. `?before=<ledger>` cursor. |
 | `GET /api/admin/failed-events` | Quarantined events (issue #43) — the operator-facing detail behind `/api/stats.quarantinedEvents`. Each row has the event id, symbol, ledger, and the error that quarantined it; the raw `events` row itself is left untouched. |
 
-All list endpoints accept `?limit=` (default 50, max 200). `?before=` is a cursor: pass the `id`/`ledger` of the last row you saw to page further back. On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
+All list endpoints accept `?limit=` (default 50, max 200). `?before=` and `?after=` are cursors: pass the `id` (or `ledger`) of the last row you saw to page. For `/api/events`, the cursor can be a deterministic `(ledger, id)` value (the event `id` string itself contains both) and ordering is strictly deterministic (`ledger DESC, id DESC` by default, or `ASC`). On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
+
+### Caching
+
+All `GET` endpoints support `ETag` and conditional requests (`If-None-Match`), returning `304 Not Modified` when the underlying data is unchanged. `Cache-Control` headers are set appropriately:
+- **Historical immutable queries** (`/events`, `/admin/log`, `/interest`, `/documents` with a `?before=` or `?after=` cursor) are cached indefinitely (`public, max-age=31536000, immutable`).
+- **Live tip queries** use a short TTL (`public, max-age=5, must-revalidate`).
+- **Per-address queries** (`/notifications`, `/members/:address/summary`) are never cached by shared caches (`private, no-cache`).
 
 ### Reorg detection
 

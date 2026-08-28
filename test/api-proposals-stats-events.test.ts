@@ -114,10 +114,10 @@ describe('API: proposals, stats, events, admin/log', () => {
        ('3-0', 30, now(), 'C1', 'joined', '[]', '[]')`
     )
     const bySymbol = await app.inject({ method: 'GET', url: '/api/events?symbol=joined' })
-    expect(bySymbol.json()).toHaveLength(2)
+    expect(bySymbol.json().events).toHaveLength(2)
 
     const paged = await app.inject({ method: 'GET', url: '/api/events?before=30' })
-    const pagedBody = paged.json()
+    const pagedBody = paged.json().events
     expect(pagedBody).toHaveLength(2)
     expect(pagedBody.every((e: { ledger: number }) => e.ledger < 30)).toBe(true)
   })
@@ -130,7 +130,7 @@ describe('API: proposals, stats, events, admin/log', () => {
        ('c-0', 30, now(), 'CNEW', 'staked', '[]', '[]')`
     )
     const scoped = await app.inject({ method: 'GET', url: '/api/events?contract=CNEW' })
-    const body = scoped.json()
+    const body = scoped.json().events
     expect(body).toHaveLength(2)
     expect(body.every((e: { contract_id: string }) => e.contract_id === 'CNEW')).toBe(true)
   })
