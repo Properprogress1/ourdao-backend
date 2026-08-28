@@ -2,9 +2,20 @@
 // These mirror the shapes the frontend (ourdao-frontend/src/types/dao.ts)
 // consumes, but represent large integers as strings so they survive JSON.
 
-export type LoanProposalStatus = 'pending' | 'approved' | 'rejected' | 'cancelled'
-export type LoanStatus = 'active' | 'repaid' | 'defaulted'
-export type TreasuryProposalStatus = 'pending' | 'executed' | 'rejected'
+// The complete set of values each status column may hold, in one place (#73).
+// The database CHECK constraints — inline in src/db/schema.sql and added to
+// existing databases by src/db/migrations/0012_status_check_constraints.sql —
+// must accept exactly these, and test/status-constraints.test.ts fails if the
+// two drift. `'cancelled'` is a declared loan-proposal state that no handler
+// writes yet; it is kept deliberately (the loan_exp work will use it for
+// expired proposals) rather than dropped.
+export const LOAN_PROPOSAL_STATUSES = ['pending', 'approved', 'rejected', 'cancelled'] as const
+export const LOAN_STATUSES = ['active', 'repaid', 'defaulted'] as const
+export const TREASURY_PROPOSAL_STATUSES = ['pending', 'executed', 'rejected'] as const
+
+export type LoanProposalStatus = (typeof LOAN_PROPOSAL_STATUSES)[number]
+export type LoanStatus = (typeof LOAN_STATUSES)[number]
+export type TreasuryProposalStatus = (typeof TREASURY_PROPOSAL_STATUSES)[number]
 
 export interface MemberRow {
   address: string

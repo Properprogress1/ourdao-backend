@@ -190,12 +190,11 @@ export async function registerStreamEndpoint(app: FastifyInstance, pool: Pool): 
   const connectedClients = new Set<StreamClient>()
 
   app.get('/api/stream', async (request, reply) => {
-    // Get a dedicated connection for LISTEN/NOTIFY
-    let client: PoolClient | null = null
     let streamClient: StreamClient | null = null
 
     try {
-      client = await pool.connect()
+      // Dedicated connection for LISTEN/NOTIFY; StreamClient owns its release.
+      const client = await pool.connect()
       streamClient = new StreamClient(reply, client)
       connectedClients.add(streamClient)
 
