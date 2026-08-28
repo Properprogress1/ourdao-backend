@@ -1,8 +1,12 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
+import { Keypair } from '@stellar/stellar-sdk'
 import { buildServer } from '../src/api/server.js'
 import { query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
+
+const ALICE = Keypair.random().publicKey()
+const NOBODY = Keypair.random().publicKey()
 
 describe('API: members and loans', () => {
   let app: FastifyInstance
@@ -36,13 +40,13 @@ describe('API: members and loans', () => {
   })
 
   it('GET /api/members/:address 404s for an unknown address', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/members/GNOBODY' })
+    const res = await app.inject({ method: 'GET', url: `/api/members/${NOBODY}` })
     expect(res.statusCode).toBe(404)
   })
 
   it('GET /api/members/:address returns the member when present', async () => {
-    await query(`INSERT INTO members (address, contribution) VALUES ('GALICE', 500)`)
-    const res = await app.inject({ method: 'GET', url: '/api/members/GALICE' })
+    await query(`INSERT INTO members (address, contribution) VALUES ($1, 500)`, [ALICE])
+    const res = await app.inject({ method: 'GET', url: `/api/members/${ALICE}` })
     expect(res.statusCode).toBe(200)
     expect(res.json().contribution).toBe('500')
   })

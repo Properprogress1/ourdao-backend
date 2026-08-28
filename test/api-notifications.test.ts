@@ -1,8 +1,19 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
+import { Keypair } from '@stellar/stellar-sdk'
 import { buildServer } from '../src/api/server.js'
 import { query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
+
+const keypair = Keypair.random()
+const address = keypair.publicKey()
+
+async function authHeader(app: FastifyInstance): Promise<string> {
+  const challenge = await app.inject({ method: 'GET', url: `/api/auth/challenge?address=${address}` })
+  const nonce = challenge.json().nonce as string
+  const signature = keypair.sign(Buffer.from(`${nonce}:${address}`)).toString('base64')
+  return `StellarSignature ${address}:${signature}:${nonce}`
+}
 
 describe('API: notification mutations', () => {
   let app: FastifyInstance
@@ -21,34 +32,52 @@ describe('API: notification mutations', () => {
 
   it('PATCH /api/notifications/:id/read marks that row read and 404s for a missing id', async () => {
     const [row] = await query<{ id: number }>(
-      `INSERT INTO notifications (address, type, title, message) VALUES ('GA', 'info', 't', 'm') RETURNING id`
+      `INSERT INTO notifications (address, type, title, message) VALUES ($1, 'info', 't', 'm') RETURNING id`,
+      [address]
     )
-    const res = await app.inject({ method: 'PATCH', url: `/api/notifications/${row!.id}/read` })
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/notifications/${row!.id}/read`,
+      headers: { authorization: await authHeader(app) },
+    })
     expect(res.statusCode).toBe(200)
     expect(res.json().read).toBe(true)
 
-    const missing = await app.inject({ method: 'PATCH', url: '/api/notifications/999999/read' })
+    const missing = await app.inject({
+      method: 'PATCH',
+      url: '/api/notifications/999999/read',
+      headers: { authorization: await authHeader(app) },
+    })
     expect(missing.statusCode).toBe(404)
   })
 
   it('PATCH /api/notifications/:id/read 400s on a non-numeric id', async () => {
-    const res = await app.inject({ method: 'PATCH', url: '/api/notifications/not-a-number/read' })
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/api/notifications/not-a-number/read',
+      headers: { authorization: await authHeader(app) },
+    })
     expect(res.statusCode).toBe(400)
   })
 
   it('PATCH /api/notifications/read-all marks only that address unread rows as read', async () => {
     await query(
       `INSERT INTO notifications (address, type, title, message, read) VALUES
-       ('GA', 'info', 't1', 'm1', false),
-       ('GA', 'info', 't2', 'm2', false),
-       ('GA', 'info', 't3', 'm3', true),
-       ('GB', 'info', 't4', 'm4', false)`
+       ($1, 'info', 't1', 'm1', false),
+       ($1, 'info', 't2', 'm2', false),
+       ($1, 'info', 't3', 'm3', true),
+       ('GB', 'info', 't4', 'm4', false)`,
+      [address]
     )
-    const res = await app.inject({ method: 'PATCH', url: '/api/notifications/read-all?address=GA' })
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/notifications/read-all?address=${address}`,
+      headers: { authorization: await authHeader(app) },
+    })
     expect(res.statusCode).toBe(200)
     expect(res.json().updated).toBe(2)
 
-    const ga = await query<{ read: boolean }>('SELECT read FROM notifications WHERE address = $1', ['GA'])
+    const ga = await query<{ read: boolean }>('SELECT read FROM notifications WHERE address = $1', [address])
     expect(ga.every((n) => n.read)).toBe(true)
 
     const gb = await query<{ read: boolean }>('SELECT read FROM notifications WHERE address = $1', ['GB'])

@@ -50,7 +50,7 @@ export function verifySignature(
     // Verify using Stellar's Keypair.verify
     const keypair = Keypair.fromPublicKey(address)
     return keypair.verify(data, signatureBuffer)
-  } catch (error) {
+  } catch {
     // Any error means invalid signature
     return false
   }
@@ -78,7 +78,7 @@ export function extractAuthHeaders(headers: Record<string, unknown>): {
   }
 
   const [address, signature, nonce] = parts
-  return { address, signature, nonce }
+  return { address: address ?? null, signature: signature ?? null, nonce: nonce ?? null }
 }
 
 // Authentication middleware function

@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify'
+import { StrKey } from '@stellar/stellar-sdk'
 import { query, queryOne } from '../../db/index.js'
 import { config } from '../../config.js'
 import { ADMIN_EVENT_SYMBOLS } from '../../stellar/events.js'
@@ -24,8 +25,19 @@ function limit(v: unknown, def = 50, max = 200): number {
 // Parse an optional numeric pagination cursor (e.g. `?before=`). Returns null
 // when absent or invalid, meaning "start from the newest row."
 function cursor(v: unknown): number | null {
-  const n = Number.parseInt(String(v ?? ''), 10)
-  return Number.isFinite(n) ? n : null
+  if (v === undefined || v === null || v === '') return null
+  const raw = String(v).trim()
+  if (!/^[0-9]+$/.test(raw)) return null
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n > 0 ? n : null
+}
+
+function invalidCursor(v: unknown): boolean {
+  return v !== undefined && cursor(v) === null
+}
+
+function validAddress(address: string): boolean {
+  return StrKey.isValidEd25519PublicKey(address)
 }
 
 // A loan's interest charge and repayment progress aren't stored columns —
@@ -57,7 +69,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     try {
       const nonce = await nonceStore.issue(address)
       return { nonce }
-    } catch (error) {
+    } catch {
       return reply.code(500).send({ error: 'Failed to generate challenge' })
     }
   })
@@ -77,6 +89,9 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   })
 
   app.get<{ Params: { address: string } }>('/members/:address', async (req, reply) => {
+    if (!validAddress(req.params.address)) {
+      return reply.code(400).send({ error: 'invalid Stellar address' })
+    }
     const m = await queryOne<MemberRow>('SELECT * FROM members WHERE address = $1', [req.params.address])
     if (!m) return reply.code(404).send({ error: 'member not found' })
     return m
@@ -89,10 +104,11 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   })
 
   // --- Loans (optional ?borrower= filter, ?before=<id> cursor) ---
-  app.get('/loans', async (req) => {
+  app.get('/loans', async (req, reply) => {
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
     const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
     const borrower = typeof q.borrower === 'string' && q.borrower ? q.borrower : null
 
     const conditions: string[] = []
@@ -112,7 +128,11 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   })
 
   app.get<{ Params: { id: string } }>('/loans/:id', async (req, reply) => {
-    const loan = await queryOne<LoanRow>('SELECT * FROM loans WHERE id = $1', [Number(req.params.id)])
+    const rawId = req.params.id.trim()
+    if (!/^[0-9]+$/.test(rawId) || !Number.isSafeInteger(Number(rawId)) || Number(rawId) <= 0) {
+      return reply.code(400).send({ error: 'invalid loan id' })
+    }
+    const loan = await queryOne<LoanRow>('SELECT * FROM loans WHERE id = $1', [Number(rawId)])
     if (!loan) return reply.code(404).send({ error: 'loan not found' })
     return withLoanDerived(loan)
   })
@@ -145,10 +165,11 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
         timeWindow: config.http.rateLimitWindowMs,
       },
     },
-  }, async (req) => {
+  }, async (req, reply) => {
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
     const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
     const symbol = typeof q.symbol === 'string' && q.symbol ? q.symbol : null
     // `?contract=<C...>` scopes the raw log to one deployment (issue #16).
     // The column is always populated; without this filter a database that
@@ -257,10 +278,11 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
   // distribution is derivable. `amount` is interest *collected* — the
   // contract keeps the indivisible remainder, so it is slightly more than the
   // sum credited to members (documented in the README).
-  app.get('/interest', async (req) => {
+  app.get('/interest', async (req, reply) => {
     const q = req.query as Record<string, unknown>
     const l = limit(q.limit)
     const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
     const params: unknown[] = []
     let where = ''
     if (before !== null) {
@@ -332,7 +354,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: M
     const secondsSinceUpdate = cursorUpdatedAt
       ? Math.floor((Date.now() - new Date(cursorUpdatedAt).getTime()) / 1000)
       : null
-    const isStale = secondsSinceUpdate !== null && secondsSinceUpdate > config.indexer.staleAfterMs
+    const isStale = cursorUpdatedAt != null &&
+      Date.now() - new Date(cursorUpdatedAt).getTime() > config.indexer.staleAfterMs
 
     return {
       totalMembers: Number(row?.total_members ?? 0),

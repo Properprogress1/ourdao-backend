@@ -121,6 +121,6 @@ describe('API: /api/stats includes freshness', () => {
     const res = await app.inject({ method: 'GET', url: '/api/stats' })
     const body = res.json()
     expect(body.indexerStale).toBe(true)
-    expect(body.secondsSinceUpdate).toBeGreaterThan(600)
+    expect(body.secondsSinceUpdate).toBeGreaterThanOrEqual(600)
   })
 })

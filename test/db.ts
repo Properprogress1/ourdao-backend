@@ -50,5 +50,8 @@ export async function resetDb(): Promise<void> {
 }
 
 export async function closeDb(): Promise<void> {
-  await pool.end()
+  // Vitest runs files in one process with fileParallelism disabled. Individual
+  // files register this hook, so ending the shared pool here would make every
+  // later file fail with "Cannot use a pool after calling end". Vitest owns
+  // process cleanup after the suite; keep this hook for per-file symmetry.
 }
