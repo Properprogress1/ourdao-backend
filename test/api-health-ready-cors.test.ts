@@ -112,7 +112,6 @@ describe('API: /api/stats includes freshness', () => {
     app = await buildServer()
     await app.ready()
   })
-  afterAll(closeDb)
 
   it('GET /api/stats returns freshness fields', async () => {
     await query(
