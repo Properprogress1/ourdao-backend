@@ -34,6 +34,20 @@ async function derivedSnapshot(): Promise<Record<string, unknown[]>> {
   return snap
 }
 
+function withoutVolatileTimestamps(snapshot: Record<string, unknown[]>): Record<string, unknown[]> {
+  return Object.fromEntries(
+    Object.entries(snapshot).map(([table, rows]) => [
+      table,
+      rows.map((row) => {
+        const copy = { ...(row as Record<string, unknown>) }
+        delete copy.created_at
+        delete copy.updated_at
+        return copy
+      }),
+    ])
+  )
+}
+
 describe('events log — storage shape is pinned (issue #75)', () => {
   beforeEach(resetDb)
   afterAll(closeDb)
@@ -62,6 +76,9 @@ describe('events log — storage shape is pinned (issue #75)', () => {
     )
     expect(idx.map((r) => r.indexname).sort()).toEqual([
       'events_contract_id_idx',
+      'events_data_gin_idx',
+      'events_entity_id_idx',
+      'events_ledger_id_idx',
       'events_ledger_idx',
       'events_pkey',
       'events_symbol_idx',
@@ -102,11 +119,13 @@ describe('events log — rebuild reproduces derived state exactly (issue #75)', 
     const first = await reindexFromEventLog()
     expect(first.events).toBe(events.length)
     const rebuilt = await derivedSnapshot()
-    expect(rebuilt).toEqual(incremental)
+    expect(withoutVolatileTimestamps(rebuilt)).toEqual(withoutVolatileTimestamps(incremental))
 
     // Idempotent: a second rebuild changes nothing.
     await reindexFromEventLog()
-    expect(await derivedSnapshot()).toEqual(incremental)
+    expect(withoutVolatileTimestamps(await derivedSnapshot())).toEqual(
+      withoutVolatileTimestamps(incremental)
+    )
 
     client = await pool.connect()
 

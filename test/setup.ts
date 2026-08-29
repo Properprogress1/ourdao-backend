@@ -1,3 +1,5 @@
+export {}
+
 // Runs before every test file. Points the shared `pool` (src/db/index.ts) at
 // a dedicated test database instead of whatever DATABASE_URL is set to for
 // dev, so tests never touch real data. `dotenv/config` (loaded by
@@ -12,6 +14,6 @@ process.env.DATABASE_URL =
 // 'info' default would drown test output in per-request log lines.
 process.env.LOG_LEVEL ??= 'silent'
 
-// Run migrations before tests
-import { migrate } from '../src/db/migrate.js'
+// Run migrations after the test database override is in place.
+const { migrate } = await import('../src/db/migrate.js')
 await migrate()

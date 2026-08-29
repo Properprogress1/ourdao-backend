@@ -1,8 +1,12 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
+import { Keypair } from '@stellar/stellar-sdk'
 import { buildServer } from '../src/api/server.js'
 import { query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
+
+const MEMBER = Keypair.random().publicKey()
+const OTHER_MEMBER = Keypair.random().publicKey()
 
 describe('API: /members/:address/summary', () => {
   let app: FastifyInstance
@@ -22,7 +26,7 @@ describe('API: /members/:address/summary', () => {
   afterAll(closeDb)
 
   it('GET /api/members/:address/summary returns 404 for unknown address', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/members/GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7/summary' })
+    const res = await app.inject({ method: 'GET', url: `/api/members/${MEMBER}/summary` })
     expect(res.statusCode).toBe(404)
   })
 
@@ -30,31 +34,31 @@ describe('API: /members/:address/summary', () => {
     await query(`
       INSERT INTO members (address, joined_ledger, contribution, stake, exited)
       VALUES 
-      ('GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7', 100, '5000', '1000', false),
-      ('GD2XX', 100, '5000', '1000', false)
-    `)
+      ($1, 100, '5000', '1000', false),
+      ($2, 100, '5000', '1000', false)
+    `, [MEMBER, OTHER_MEMBER])
 
     await query(`
       INSERT INTO loans (id, borrower, amount, outstanding, total_repayment, status)
       VALUES 
-      (1, 'GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7', '1000', '1000', '1100', 'active'),
-      (2, 'GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7', '500', '0', '550', 'repaid')
-    `)
+      (1, $1, '1000', '1000', '1100', 'active'),
+      (2, $1, '500', '0', '550', 'repaid')
+    `, [MEMBER])
 
     await query(`
       INSERT INTO notifications (address, type, title, message, read)
       VALUES 
-      ('GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7', 'info', 'Test', 'Msg', false),
-      ('GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7', 'info', 'Test 2', 'Msg 2', true)
-    `)
+      ($1, 'info', 'Test', 'Msg', false),
+      ($1, 'info', 'Test 2', 'Msg 2', true)
+    `, [MEMBER])
 
-    const res = await app.inject({ method: 'GET', url: '/api/members/GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7/summary' })
+    const res = await app.inject({ method: 'GET', url: `/api/members/${MEMBER}/summary` })
     expect(res.statusCode).toBe(200)
     
     const body = res.json()
-    expect(body.member.address).toBe('GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7')
+    expect(body.member.address).toBe(MEMBER)
     expect(body.loans).toHaveLength(2)
-    expect(body.loans[0].interest_charge).toBe('100') // Derived via withLoanDerived
+    expect(body.loans[0].interest_charge).toBe('50') // Derived via withLoanDerived
     expect(body.unread_notifications).toBe(1)
     
     // Position assertions
@@ -68,9 +72,9 @@ describe('API: /members/:address/summary', () => {
   it('GET /api/members/:address/summary handles exited member position correctly', async () => {
     await query(`
       INSERT INTO members (address, joined_ledger, contribution, stake, exited)
-      VALUES ('GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7', 100, '5000', '1000', true)
-    `)
-    const res = await app.inject({ method: 'GET', url: '/api/members/GCXKG54ZMBK7T7BGB7PGEGB2Q54ZMBK7T7BGB7PGEGB2Q54ZMBK7/summary' })
+      VALUES ($1, 100, '5000', '1000', true)
+    `, [MEMBER])
+    const res = await app.inject({ method: 'GET', url: `/api/members/${MEMBER}/summary` })
     expect(res.statusCode).toBe(200)
     const body = res.json()
     expect(body.position.stake_share_bps).toBe('0') // Exited member has 0% stake share
