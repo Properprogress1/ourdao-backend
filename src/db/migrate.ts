@@ -24,7 +24,7 @@ async function loadMigrationFiles(): Promise<MigrationFile[]> {
   try {
     entries = await readdir(migrationsDir)
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return []
+    if ((err as { code?: string }).code === 'ENOENT') return []
     throw err
   }
   return entries

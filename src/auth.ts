@@ -13,7 +13,7 @@ export class MemoryNonceStore implements NonceStore {
   private store = new Map<string, { nonce: string; expiresAt: number }>()
   private readonly TTL_MS = 5 * 60 * 1000 // 5 minutes
   private readonly MAX_ENTRIES = 10000 // Hard cap on stored entries
-  private sweepTimer: NodeJS.Timeout | null = null
+  private sweepTimer: ReturnType<typeof setInterval> | null = null
 
   constructor() {
     // Start periodic sweep of expired entries, unref'd so it doesn't hold process open
@@ -83,7 +83,7 @@ export class MemoryNonceStore implements NonceStore {
 export class PostgresNonceStore implements NonceStore {
   private pool: Pool
   private readonly TTL_MS = 5 * 60 * 1000 // 5 minutes
-  private cleanupTimer: NodeJS.Timeout | null = null
+  private cleanupTimer: ReturnType<typeof setInterval> | null = null
 
   constructor(pool: Pool) {
     this.pool = pool

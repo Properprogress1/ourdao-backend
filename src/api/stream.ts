@@ -46,7 +46,7 @@ export class StreamClient {
   private reply: FastifyReply
   private client: PoolClient
   private channels: Set<StreamChannel> = new Set()
-  private heartbeatTimer: NodeJS.Timeout | null = null
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private closed = false
 
   constructor(reply: FastifyReply, client: PoolClient) {

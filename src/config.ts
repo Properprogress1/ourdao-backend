@@ -1,18 +1,20 @@
 import 'dotenv/config'
 
-export function str(env: NodeJS.ProcessEnv, name: string, fallback = ''): string {
+export type ProcessEnv = Record<string, string | undefined>
+
+export function str(env: ProcessEnv, name: string, fallback = ''): string {
   const v = env[name]
   return v === undefined || v === '' ? fallback : v
 }
 
-export function int(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+export function int(env: ProcessEnv, name: string, fallback: number): number {
   const v = env[name]
   if (v === undefined || v === '') return fallback
   const n = Number(v.trim())
   return Number.isFinite(n) && Number.isInteger(n) ? n : fallback
 }
 
-export function bool(env: NodeJS.ProcessEnv, name: string, fallback = false): boolean {
+export function bool(env: ProcessEnv, name: string, fallback = false): boolean {
   const v = env[name]
   if (v === undefined || v === '') return fallback
   return v === 'true' || v === '1'
@@ -36,7 +38,7 @@ export function parseCorsOrigin(raw: string | undefined): string {
 }
 
 /** Resolved runtime configuration, read once at import time. */
-export function resolveConfig(env: NodeJS.ProcessEnv) {
+export function resolveConfig(env: ProcessEnv) {
   return {
   http: {
     port: int(env, 'PORT', 4000),
